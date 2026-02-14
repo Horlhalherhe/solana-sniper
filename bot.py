@@ -1,7 +1,6 @@
 """
 SOLANA_NARRATIVE_SNIPER — BOT LOOP
 Pump.fun WebSocket → auto-score → Telegram alert
-Runs forever as a Railway worker.
 """
 
 import asyncio
@@ -16,10 +15,7 @@ import httpx
 import websockets
 
 sys.path.insert(0, str(Path(__file__).parent))
-
 from sniper import SolanaNarrativeSniper
-
-# ─── Logging ──────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,23 +24,17 @@ logging.basicConfig(
 )
 log = logging.getLogger("sniper-bot")
 
-# ─── Config ───────────────────────────────────────────────────────────────────
-
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 HELIUS_API_KEY     = os.getenv("HELIUS_API_KEY", "")
 BIRDEYE_API_KEY    = os.getenv("BIRDEYE_API_KEY", "")
-
 ALERT_THRESHOLD    = float(os.getenv("ALERT_THRESHOLD", "5.5"))
 MIN_LIQUIDITY      = float(os.getenv("MIN_LIQUIDITY_USD", "5000"))
+PUMP_WS_URL        = "wss://pumpportal.fun/api/data"
 
-PUMP_WS_URL = "wss://pumpportal.fun/api/data"
-
-# ─── Telegram ────────────────────────────────────────────────────────────────
 
 async def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram not configured — printing alert only")
         print(text)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -63,7 +53,7 @@ async def send_telegram(text: str):
         log.error(f"Telegram send failed: {e}")
 
 
-def format_telegram_alert(alert) -> str:
+def format_alert(alert) -> str:
     e = alert.entry
     r = alert.rug
     t = alert.token
@@ -73,24 +63,9 @@ def format_telegram_alert(alert) -> str:
     rug_score   = r.get("rug_score", 10)
     verdict     = e.get("verdict", "")
     rug_verdict = r.get("verdict", "")
-
-    # Score emoji
-    if entry_score >= 8:
-        score_emoji = "🟢"
-    elif entry_score >= 6.5:
-        score_emoji = "🟡"
-    else:
-        score_emoji = "🟠"
-
-    flags = r.get("flags", [])
-    flag_str = "  ".join([f"⛔ {f['code']}" for f in flags[:3]]) if flags else "✅ None"
-
-    narrative_kw = n.get("narrative", {}).get("keyword", "none").upper() if n.get("narrative") else "NONE"
-    narrative_score = n.get("narrative_score", 0)
-
-    signals = e.get("signals", [])
-    warnings = e.get("warnings", [])
-
+    flags       = r.get("flags", [])
+    flag_str    = "  ".join([f"⛔ {f['code']}" for f in flags[:3]]) if flags else "✅ None"
+    narrative_kw = (n.get("narrative") or {}).get("keyword", "NONE")
     comps = e.get("components", {})
 
     lines = [
@@ -99,199 +74,143 @@ def format_telegram_alert(alert) -> str:
         f"<b>{t.get('name','?')}</b>  <code>${t.get('symbol','?')}</code>",
         f"<code>{t.get('mint', 'N/A')}</code>",
         f"",
-        f"📊 <b>ENTRY SCORE:  {entry_score}/10  {verdict}</b>",
-        f"🔒 <b>RUG SCORE:    {rug_score}/10  {rug_verdict}</b>",
+        f"📊 <b>ENTRY:  {entry_score}/10  {verdict}</b>",
+        f"🔒 <b>RUG:    {rug_score}/10  {rug_verdict}</b>",
         f"",
-        f"📡 Narrative:  <b>{narrative_kw}</b>  ({narrative_score:.1f}/10)",
-        f"💧 Liquidity:  <b>${t.get('liquidity_usd', 0):,.0f}</b>",
-        f"👥 Holders:    <b>{t.get('total_holders', 0)}</b>",
-        f"⏱ Age:        <b>{t.get('age_hours', 0):.1f}h</b>",
-        f"📈 Vol 1h:     <b>${t.get('volume_1h_usd', 0):,.0f}</b>",
+        f"📡 Narrative:  <b>{narrative_kw.upper()}</b>  ({n.get('narrative_score',0):.1f}/10)",
+        f"💧 Liquidity:  <b>${t.get('liquidity_usd',0):,.0f}</b>",
+        f"👥 Holders:    <b>{t.get('total_holders',0)}</b>",
+        f"⏱ Age:        <b>{t.get('age_hours',0):.1f}h</b>",
+        f"📈 Vol 1h:     <b>${t.get('volume_1h_usd',0):,.0f}</b>",
         f"",
-        f"── Components ──",
         f"NAR {comps.get('narrative',{}).get('score','?')}  "
         f"TIM {comps.get('timing',{}).get('score','?')}  "
         f"HOL {comps.get('holders',{}).get('score','?')}  "
         f"DEP {comps.get('deployer',{}).get('score','?')}  "
         f"MOM {comps.get('momentum',{}).get('score','?')}",
         f"",
-        f"── Flags ──",
-        flag_str,
+        f"<b>Flags:</b> {flag_str}",
     ]
 
-    if signals:
-        lines += ["", "── Signals ──"]
-        lines += [f"✅ {s}" for s in signals[:3]]
-
-    if warnings:
-        lines += ["", "── Warnings ──"]
-        lines += [f"⚠️ {w}" for w in warnings[:3]]
+    if e.get("signals"):
+        lines += [""] + [f"✅ {s}" for s in e["signals"][:3]]
+    if e.get("warnings"):
+        lines += [f"⚠️ {w}" for w in e["warnings"][:3]]
 
     lines += [
         "",
-        f"🔗 <a href='https://pump.fun/{t.get('mint','')}'>[pump.fun]</a>  "
-        f"<a href='https://dexscreener.com/solana/{t.get('mint','')}'>[dexscreener]</a>  "
-        f"<a href='https://solscan.io/token/{t.get('mint','')}'>[solscan]</a>",
-        f"",
+        f"🔗 <a href='https://pump.fun/{t.get('mint','')}'>pump.fun</a>  "
+        f"<a href='https://dexscreener.com/solana/{t.get('mint','')}'>dexscreener</a>  "
+        f"<a href='https://solscan.io/token/{t.get('mint','')}'>solscan</a>",
         f"<i>🕐 {datetime.utcnow().strftime('%H:%M:%S UTC')}</i>",
     ]
-
     return "\n".join(lines)
 
 
-# ─── Token Data Fetcher ───────────────────────────────────────────────────────
-
 async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> dict:
-    """
-    Fetch live on-chain data for a new token.
-    Falls back to defaults if no API keys set.
-    """
     base = {
-        "mint": mint,
-        "name": name,
-        "symbol": symbol,
-        "deployer": deployer,
-        "age_hours": 0.02,       # Just launched
-        "mcap_usd": 0,
-        "liquidity_usd": 0,
-        "total_holders": 1,
-        "top1_pct": 90.0,        # Default to worst case
-        "top5_pct": 95.0,
-        "top10_pct": 99.0,
-        "dev_holds_pct": 80.0,
-        "wallet_clusters": 0,
-        "holder_growth_1h": 0,
-        "mint_authority_revoked": False,
-        "freeze_authority_revoked": False,
-        "lp_burned": False,
-        "lp_locked": False,
-        "liquidity_usd": 0,
-        "pool_age_hours": 0.0,
-        "deployer_age_days": 0,
-        "deployer_prev_tokens": [],
-        "deployer_prev_rugs": [],
-        "volume_5m_usd": 0,
-        "volume_1h_usd": 0,
-        "price_change_5m_pct": 0,
-        "price_change_1h_pct": 0,
-        "buy_sell_ratio_1h": 1.0,
-        "market_conditions": "neutral",
+        "mint": mint, "name": name, "symbol": symbol, "deployer": deployer,
+        "age_hours": 0.02, "mcap_usd": 0, "liquidity_usd": 0,
+        "total_holders": 1, "top1_pct": 90.0, "top5_pct": 95.0,
+        "top10_pct": 99.0, "dev_holds_pct": 80.0, "wallet_clusters": 0,
+        "holder_growth_1h": 0, "mint_authority_revoked": False,
+        "freeze_authority_revoked": False, "lp_burned": False,
+        "lp_locked": False, "pool_age_hours": 0.0, "deployer_age_days": 0,
+        "deployer_prev_tokens": [], "deployer_prev_rugs": [],
+        "volume_5m_usd": 0, "volume_1h_usd": 0,
+        "price_change_5m_pct": 0, "price_change_1h_pct": 0,
+        "buy_sell_ratio_1h": 1.0, "market_conditions": "neutral",
     }
+    if BIRDEYE_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.get(
+                    "https://public-api.birdeye.so/defi/token_overview",
+                    params={"address": mint},
+                    headers={"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana"}
+                )
+                if resp.status_code == 200:
+                    data = resp.json().get("data", {})
+                    base.update({
+                        "mcap_usd": data.get("mc", 0) or 0,
+                        "liquidity_usd": data.get("liquidity", 0) or 0,
+                        "volume_1h_usd": data.get("v1hUSD", 0) or 0,
+                        "volume_5m_usd": data.get("v5mUSD", 0) or 0,
+                        "price_change_1h_pct": data.get("priceChange1hPercent", 0) or 0,
+                        "price_change_5m_pct": data.get("priceChange5mPercent", 0) or 0,
+                        "buy_sell_ratio_1h": (data.get("buy1h", 1) / max(data.get("sell1h", 1), 1)),
+                        "total_holders": data.get("holder", 1) or 1,
+                    })
+        except Exception as e:
+            log.warning(f"Birdeye error: {e}")
 
-    if not BIRDEYE_API_KEY:
-        return base
-
-    try:
-        async with httpx.AsyncClient(timeout=8) as client:
-            resp = await client.get(
-                "https://public-api.birdeye.so/defi/token_overview",
-                params={"address": mint},
-                headers={"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana"}
-            )
-            if resp.status_code == 200:
-                data = resp.json().get("data", {})
-                base.update({
-                    "mcap_usd": data.get("mc", 0) or 0,
-                    "liquidity_usd": data.get("liquidity", 0) or 0,
-                    "volume_1h_usd": data.get("v1hUSD", 0) or 0,
-                    "volume_5m_usd": data.get("v5mUSD", 0) or 0,
-                    "price_change_1h_pct": data.get("priceChange1hPercent", 0) or 0,
-                    "price_change_5m_pct": data.get("priceChange5mPercent", 0) or 0,
-                    "buy_sell_ratio_1h": (data.get("buy1h", 1) / max(data.get("sell1h", 1), 1)),
-                    "total_holders": data.get("holder", 1) or 1,
-                })
-    except Exception as e:
-        log.warning(f"Birdeye fetch failed for {mint}: {e}")
-
-    if not HELIUS_API_KEY:
-        return base
-
-    # Check mint/freeze authority via Helius RPC
-    try:
-        async with httpx.AsyncClient(timeout=8) as client:
-            resp = await client.post(
-                f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
-                json={
-                    "jsonrpc": "2.0", "id": 1,
-                    "method": "getAccountInfo",
-                    "params": [mint, {"encoding": "jsonParsed"}]
-                }
-            )
-            if resp.status_code == 200:
-                info = resp.json().get("result", {}).get("value", {})
-                parsed = info.get("data", {}).get("parsed", {}).get("info", {})
-                base["mint_authority_revoked"] = parsed.get("mintAuthority") is None
-                base["freeze_authority_revoked"] = parsed.get("freezeAuthority") is None
-    except Exception as e:
-        log.warning(f"Helius auth check failed: {e}")
+    if HELIUS_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.post(
+                    f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
+                    json={"jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
+                          "params": [mint, {"encoding": "jsonParsed"}]}
+                )
+                if resp.status_code == 200:
+                    info = resp.json().get("result", {}).get("value", {})
+                    parsed = info.get("data", {}).get("parsed", {}).get("info", {})
+                    base["mint_authority_revoked"] = parsed.get("mintAuthority") is None
+                    base["freeze_authority_revoked"] = parsed.get("freezeAuthority") is None
+        except Exception as e:
+            log.warning(f"Helius error: {e}")
 
     return base
 
 
-# ─── Bot Loop ─────────────────────────────────────────────────────────────────
-
 async def run_bot():
     sniper = SolanaNarrativeSniper()
 
-    # Seed initial narratives from env (comma-separated)
     seed = os.getenv("SEED_NARRATIVES", "")
     if seed:
         for item in seed.split("|"):
             parts = [p.strip() for p in item.split(",")]
             if len(parts) >= 3:
                 sniper.inject_narrative(parts[0], parts[1], float(parts[2]))
-                log.info(f"Seeded narrative: {parts[0]} ({parts[1]}) score={parts[2]}")
 
     log.info("=" * 50)
     log.info("  SOLANA_NARRATIVE_SNIPER — BOT ONLINE")
-    log.info(f"  Alert threshold: {ALERT_THRESHOLD}")
-    log.info(f"  Min liquidity:   ${MIN_LIQUIDITY:,.0f}")
-    log.info(f"  Telegram:        {'✓ configured' if TELEGRAM_BOT_TOKEN else '✗ not set'}")
-    log.info(f"  Helius:          {'✓' if HELIUS_API_KEY else '✗'}")
-    log.info(f"  Birdeye:         {'✓' if BIRDEYE_API_KEY else '✗'}")
+    log.info(f"  Threshold: {ALERT_THRESHOLD}  MinLP: ${MIN_LIQUIDITY:,.0f}")
+    log.info(f"  Telegram: {'✓' if TELEGRAM_BOT_TOKEN else '✗'}")
+    log.info(f"  Helius: {'✓' if HELIUS_API_KEY else '✗'}  Birdeye: {'✓' if BIRDEYE_API_KEY else '✗'}")
     log.info("=" * 50)
 
     await send_telegram(
         "🎯 <b>SOLANA_NARRATIVE_SNIPER ONLINE</b>\n"
-        f"Watching Pump.fun live stream\n"
-        f"Alert threshold: {ALERT_THRESHOLD}/10\n"
+        f"Watching Pump.fun live\n"
+        f"Threshold: {ALERT_THRESHOLD}/10\n"
         f"<i>Waiting for tokens...</i>"
     )
 
     while True:
         try:
-            await _connect_and_listen(sniper)
+            await _listen(sniper)
         except Exception as e:
-            log.error(f"Connection dropped: {e} — reconnecting in 5s")
+            log.error(f"Disconnected: {e} — reconnecting in 5s")
             await asyncio.sleep(5)
 
 
-async def _connect_and_listen(sniper: SolanaNarrativeSniper):
-    log.info(f"Connecting to Pump.fun WebSocket...")
-
+async def _listen(sniper):
+    log.info("Connecting to Pump.fun...")
     async with websockets.connect(
-        PUMP_WS_URL,
-        ping_interval=20,
-        ping_timeout=10,
-        close_timeout=5,
+        PUMP_WS_URL, ping_interval=20, ping_timeout=10
     ) as ws:
-
-        # Subscribe to new token events
         await ws.send(json.dumps({"method": "subscribeNewToken"}))
         log.info("✓ Subscribed to new token stream")
-
-        async for raw_msg in ws:
+        async for raw in ws:
             try:
-                msg = json.loads(raw_msg)
-                await handle_message(sniper, msg)
-            except json.JSONDecodeError:
-                pass
+                msg = json.loads(raw)
+                await handle(sniper, msg)
             except Exception as e:
-                log.error(f"Message handling error: {e}")
+                log.error(f"Error: {e}")
 
 
-async def handle_message(sniper: SolanaNarrativeSniper, msg: dict):
-    # Only process new token creations
+async def handle(sniper, msg: dict):
     if msg.get("txType") != "create":
         return
 
@@ -304,43 +223,26 @@ async def handle_message(sniper: SolanaNarrativeSniper, msg: dict):
     if not mint or not name:
         return
 
-    log.info(f"New token: {name} (${symbol}) — {mint[:12]}...")
+    log.info(f"New: {name} (${symbol}) {mint[:12]}...")
 
-    # Check narrative match FIRST (fast filter before enrichment)
-    quick_match = sniper.narrative_engine.match_token_to_narrative(name, symbol, desc)
-    if not quick_match["matched"] and quick_match.get("narrative_score", 0) < 2:
-        log.info(f"  ↳ No narrative match — skipping")
+    quick = sniper.narrative_engine.match_token_to_narrative(name, symbol, desc)
+    if not quick["matched"]:
+        log.info(f"  ↳ No narrative match — skip")
         return
 
-    # Enrich with on-chain data
     token_data = await enrich_token(mint, name, symbol, deployer)
     token_data["description"] = desc
 
-    # Skip if too low liquidity
-    if token_data["liquidity_usd"] < MIN_LIQUIDITY and BIRDEYE_API_KEY:
-        log.info(f"  ↳ Liquidity too low (${token_data['liquidity_usd']:,.0f}) — skipping")
-        return
-
-    # Full analysis
     alert = sniper.analyze_token(token_data)
     entry_score = alert.entry.get("final_score", 0)
     rug_score   = alert.rug.get("rug_score", 10)
 
-    log.info(
-        f"  ↳ Entry: {entry_score}/10  Rug: {rug_score}/10  "
-        f"{alert.entry.get('verdict','')}"
-    )
+    log.info(f"  ↳ Entry: {entry_score}/10  Rug: {rug_score}/10  {alert.entry.get('verdict','')}")
 
-    # Fire alert if above threshold
     if entry_score >= ALERT_THRESHOLD:
-        log.info(f"  🚨 ALERT TRIGGERED — sending to Telegram")
-        msg_text = format_telegram_alert(alert)
-        await send_telegram(msg_text)
-    else:
-        log.info(f"  ↳ Below threshold ({ALERT_THRESHOLD}) — no alert")
+        log.info(f"  🚨 FIRING ALERT")
+        await send_telegram(format_alert(alert))
 
-
-# ─── Entry ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     asyncio.run(run_bot())
