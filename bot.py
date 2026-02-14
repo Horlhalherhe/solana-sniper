@@ -113,9 +113,9 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> dict
         "age_hours": 0.02, "mcap_usd": 0, "liquidity_usd": 0,
         "total_holders": 1, "top1_pct": 50.0, "top5_pct": 70.0,
         "top10_pct": 80.0, "dev_holds_pct": 20.0, "wallet_clusters": 0,
-        "holder_growth_1h": 0, "mint_authority_revoked": False,
-        "freeze_authority_revoked": False, "lp_burned": False,
-        "lp_locked": False, "pool_age_hours": 0.0, "deployer_age_days": 0,
+        "holder_growth_1h": 0, "mint_authority_revoked": True,
+        "freeze_authority_revoked": True, "lp_burned": False,
+        "lp_locked": True, "pool_age_hours": 0.0, "deployer_age_days": 0,
         "deployer_prev_tokens": [], "deployer_prev_rugs": [],
         "volume_5m_usd": 0, "volume_1h_usd": 0,
         "price_change_5m_pct": 0, "price_change_1h_pct": 0,
@@ -143,7 +143,7 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> dict
                     })
         except Exception as e:
             log.warning(f"Birdeye error: {e}")
-
+    base["lp_locked"] = base["liquidity_usd"] > 5000
     if HELIUS_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=8) as client:
