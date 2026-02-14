@@ -111,8 +111,8 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> dict
     base = {
         "mint": mint, "name": name, "symbol": symbol, "deployer": deployer,
         "age_hours": 0.02, "mcap_usd": 0, "liquidity_usd": 0,
-        "total_holders": 1, "top1_pct": 90.0, "top5_pct": 95.0,
-        "top10_pct": 99.0, "dev_holds_pct": 80.0, "wallet_clusters": 0,
+        "total_holders": 1, "top1_pct": 50.0, "top5_pct": 70.0,
+        "top10_pct": 80.0, "dev_holds_pct": 20.0, "wallet_clusters": 0,
         "holder_growth_1h": 0, "mint_authority_revoked": False,
         "freeze_authority_revoked": False, "lp_burned": False,
         "lp_locked": False, "pool_age_hours": 0.0, "deployer_age_days": 0,
@@ -234,6 +234,7 @@ async def handle(sniper, msg: dict):
         log.info(f"  ↳ No narrative match — skip")
         return
 
+    await asyncio.sleep(30)
     token_data = await enrich_token(mint, name, symbol, deployer)
     token_data["description"] = desc
 
