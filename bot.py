@@ -153,10 +153,14 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> dict
                           "params": [mint, {"encoding": "jsonParsed"}]}
                 )
                 if resp.status_code == 200:
-                    info = resp.json().get("result", {}).get("value", {})
-                    parsed = info.get("data", {}).get("parsed", {}).get("info", {})
-                    base["mint_authority_revoked"] = parsed.get("mintAuthority") is None
-                    base["freeze_authority_revoked"] = parsed.get("freezeAuthority") is None
+                    result = resp.json().get("result") or {}
+                    value = result.get("value") or {}
+                    data = value.get("data") or {}
+                    parsed = data.get("parsed") or {}
+                    info = parsed.get("info") or {}
+                    if info:
+                        base["mint_authority_revoked"] = info.get("mintAuthority") is None
+                        base["freeze_authority_revoked"] = info.get("freezeAuthority") is None
         except Exception as e:
             log.warning(f"Helius error: {e}")
 
