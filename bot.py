@@ -238,6 +238,18 @@ async def handle(sniper, msg: dict):
     token_data = await enrich_token(mint, name, symbol, deployer)
     token_data["description"] = desc
 
+    # If no liquidity yet, wait and retry once
+    if token_data["liquidity_usd"] == 0:
+        log.info(f"  ↳ No liquidity yet — waiting 60s and retrying")
+        await asyncio.sleep(60)
+        token_data = await enrich_token(mint, name, symbol, deployer)
+        token_data["description"] = desc
+
+    # Skip if still no liquidity
+    if token_data["liquidity_usd"] == 0:
+        log.info(f"  ↳ Still no liquidity after retry — skip")
+        return
+
     alert = sniper.analyze_token(token_data)
     entry_score = alert.entry.get("final_score", 0)
     rug_score   = alert.rug.get("rug_score", 10)
