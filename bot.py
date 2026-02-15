@@ -583,6 +583,20 @@ async def analyze_ca(mint: str) -> str:
                 return result + f"\n\n<i>🔄 Cached result ({RUG_CACHE_TTL_SECONDS}s TTL)</i>"
     
     data = await enrich_token(mint, "Unknown", "???", "unknown")
+
+    # If Birdeye returned no real data, warn user
+    if data.get("mcap_usd", 0) == 0 and data.get("liquidity_usd", 0) == 0:
+        return (
+            f"⚠️ <b>No market data found</b>\n\n"
+            f"<code>{mint}</code>\n\n"
+            f"Birdeye has no data for this token yet.\n"
+            f"Possible reasons:\n"
+            f"  • Token too new (try again in 2-3 mins)\n"
+            f"  • Invalid or non-existent address\n"
+            f"  • Not yet indexed by Birdeye\n\n"
+            f"🔗 <a href='https://dexscreener.com/solana/{mint}'>Check DexScreener</a>  "
+            f"<a href='https://solscan.io/token/{mint}'>Solscan</a>"
+        )
     
     try:
         from core.rug_analyzer import RugAnalyzer
