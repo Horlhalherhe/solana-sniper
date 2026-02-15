@@ -132,6 +132,10 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> dict
                 if resp.status_code == 200:
                     data = resp.json().get("data", {})
                     base.update({
+                        if resp.status_code == 200:
+                data = resp.json().get("data", {})
+                log.info(f"  ↳ Birdeye data: liq={data.get('liquidity')} vol={data.get('v1hUSD')} holders={data.get('holder')}")
+                base.update({
                         "mcap_usd": data.get("mc", 0) or 0,
                         "liquidity_usd": data.get("liquidity", 0) or 0,
                         "volume_1h_usd": data.get("v1hUSD", 0) or 0,
