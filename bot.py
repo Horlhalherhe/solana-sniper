@@ -1242,22 +1242,16 @@ async def handle_token(sniper, msg: dict):
     # Exponential backoff for liquidity
     token_data = None
     delays = [30, 60, 120]
-    
+
     for i, delay in enumerate(delays):
         if i > 0:
-            log.info(f"  -> Retrying liquidity check in {delay}s...")
+            log.info(f"  -> Retrying in {delay}s...")
             await asyncio.sleep(delay)
         else:
             await asyncio.sleep(30)
-        
+
         if i == 0:
             token_data = await enrich_token(mint, name, symbol, deployer)
-            if token_data.get("liquidity_usd") == 0:
-                # Quick check if Birdeye rejects this address entirely
-                test = await fetch_liquidity_only(mint)
-                if test == -1.0:
-                    log.info(f"  -> Birdeye rejected address — skip")
-                    return
         else:
             liq = await fetch_liquidity_only(mint)
             if liq == -1.0:
@@ -1267,13 +1261,13 @@ async def handle_token(sniper, msg: dict):
                 token_data["liquidity_usd"] = liq
             else:
                 continue
-        
+
         token_data["description"] = desc
-        
+
         if token_data["liquidity_usd"] >= MIN_LIQUIDITY:
             break
     else:
-        log.info(f"  -> No liquidity after {len(delays)} attempts")
+        log.info(f"  -> No liquidity after {len(delays)} attempts — skip")
         return
     
     # CHANGED: top1_pct > 5 -> top1_pct > 10
