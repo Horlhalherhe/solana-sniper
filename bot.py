@@ -1,9 +1,10 @@
 """
 SOLANA_NARRATIVE_SNIPER — BOT LOOP
-Pump.fun → score → Telegram alerts
+Pump.fun -> score -> Telegram alerts
 + Post-alert tracker: X multipliers + migration
 + PnL Leaderboard: 24h, weekly, monthly
-+ Telegram commands: /leaderboard /status /narratives /help
++ Telegram commands: /rug /status /leaderboard /weekly /monthly /narratives /tracking /help
++ Inline buttons: Refresh / Delete on rug checks
 """
 
 import asyncio
@@ -87,9 +88,12 @@ class TrackedToken:
 
 tracked: dict[str, TrackedToken] = {}
 leaderboard_history: list[dict] = []
-sniper_ref: SolanaNarrativeSniper = None  # global ref for commands
+sniper_ref: SolanaNarrativeSniper = None
 bot_start_time = utcnow()
 total_alerts_fired = 0
+
+# mint -> message_id mapping for rug check refresh
+rug_message_map: dict[str, dict] = {}   # mint -> {message_id, chat_id}
 
 
 # ─── Persistence ──────────────────────────────────────────────────────────────
@@ -114,28 +118,115 @@ def load_leaderboard():
         log.error(f"Leaderboard load error: {e}")
 
 
-# ─── Telegram ─────────────────────────────────────────────────────────────────
+# ─── Telegram API ─────────────────────────────────────────────────────────────
 
-async def send_telegram(text: str, chat_id: str = None):
+async def send_telegram(text: str, chat_id: str = None) -> int:
+    """Send message, returns message_id."""
     if not TELEGRAM_BOT_TOKEN:
         print(text)
-        return
+        return 0
     cid = chat_id or TELEGRAM_CHAT_ID
     if not cid:
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        return 0
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(url, json={
-                "chat_id": cid,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            })
-            if resp.status_code != 200:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id": cid,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                }
+            )
+            if resp.status_code == 200:
+                return resp.json().get("result", {}).get("message_id", 0)
+            else:
                 log.error(f"Telegram error: {resp.text}")
     except Exception as e:
         log.error(f"Telegram send failed: {e}")
+    return 0
+
+
+async def send_telegram_with_buttons(text: str, buttons: list, chat_id: str = None) -> int:
+    """Send message with inline keyboard buttons, returns message_id."""
+    if not TELEGRAM_BOT_TOKEN:
+        print(text)
+        return 0
+    cid = chat_id or TELEGRAM_CHAT_ID
+    if not cid:
+        return 0
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id": cid,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                    "reply_markup": {
+                        "inline_keyboard": buttons
+                    }
+                }
+            )
+            if resp.status_code == 200:
+                return resp.json().get("result", {}).get("message_id", 0)
+            else:
+                log.error(f"Telegram buttons error: {resp.text}")
+    except Exception as e:
+        log.error(f"Telegram send failed: {e}")
+    return 0
+
+
+async def edit_telegram_message(chat_id: str, message_id: int, text: str, buttons: list = None):
+    """Edit an existing message."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if buttons:
+        payload["reply_markup"] = {"inline_keyboard": buttons}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText",
+                json=payload
+            )
+    except Exception as e:
+        log.error(f"Edit message failed: {e}")
+
+
+async def delete_telegram_message(chat_id: str, message_id: int):
+    """Delete a message."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage",
+                json={"chat_id": chat_id, "message_id": message_id}
+            )
+    except Exception as e:
+        log.error(f"Delete message failed: {e}")
+
+
+async def answer_callback(callback_id: str, text: str = ""):
+    """Acknowledge a callback query."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                json={"callback_query_id": callback_id, "text": text}
+            )
+    except Exception:
+        pass
+
 
 async def get_telegram_updates(offset: int = 0) -> list:
     if not TELEGRAM_BOT_TOKEN:
@@ -144,13 +235,25 @@ async def get_telegram_updates(offset: int = 0) -> list:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
-                params={"offset": offset, "timeout": 5, "allowed_updates": ["message"]}
+                params={
+                    "offset": offset,
+                    "timeout": 5,
+                    "allowed_updates": ["message", "callback_query"]
+                }
             )
             if resp.status_code == 200:
                 return resp.json().get("result", [])
     except Exception:
         pass
     return []
+
+
+def rug_buttons(mint: str) -> list:
+    """Inline keyboard for rug check messages."""
+    return [[
+        {"text": "🔄 Refresh", "callback_data": f"rug_refresh:{mint}"},
+        {"text": "🗑 Delete",  "callback_data": f"rug_delete:{mint}"},
+    ]]
 
 
 # ─── Formatters ───────────────────────────────────────────────────────────────
@@ -229,7 +332,7 @@ def format_migration_alert(token: TrackedToken, current_mcap: float) -> str:
         f"<b>{token.name}</b>  <code>${token.symbol}</code>",
         f"<code>{token.mint}</code>",
         "",
-        f"✅ Graduated Pump.fun → <b>Raydium</b>",
+        f"✅ Graduated Pump.fun -> <b>Raydium</b>",
         f"MCap at migration: <b>${current_mcap:,.0f}</b>",
         f"Entry MCap:        <b>${token.entry_mcap:,.0f}</b>",
         f"Multiplier:        <b>{token.current_x()}X</b>",
@@ -245,11 +348,7 @@ def format_leaderboard(records: list[dict], period: str) -> str:
         return f"📊 <b>{period} LEADERBOARD</b>\n\nNo alerts recorded yet."
     sorted_records = sorted(records, key=lambda x: x.get("peak_x", 0), reverse=True)
     medals = ["🥇", "🥈", "🥉"]
-    lines  = [
-        f"📊 <b>{period} LEADERBOARD</b>",
-        f"<i>{len(records)} tokens tracked</i>",
-        "",
-    ]
+    lines  = [f"📊 <b>{period} LEADERBOARD</b>", f"<i>{len(records)} tokens tracked</i>", ""]
     for i, r in enumerate(sorted_records[:10]):
         medal      = medals[i] if i < 3 else f"{i+1}."
         peak_x     = r.get("peak_x", 1)
@@ -282,17 +381,16 @@ def format_leaderboard(records: list[dict], period: str) -> str:
 
 
 def format_status() -> str:
-    uptime = utcnow() - bot_start_time
-    hours  = int(uptime.total_seconds() // 3600)
-    mins   = int((uptime.total_seconds() % 3600) // 60)
-    active = len(tracked)
-    total  = len(leaderboard_history) + active
+    uptime     = utcnow() - bot_start_time
+    hours      = int(uptime.total_seconds() // 3600)
+    mins       = int((uptime.total_seconds() % 3600) // 60)
+    active     = len(tracked)
+    total      = len(leaderboard_history) + active
     narratives = len(sniper_ref.narrative_engine.active_narratives) if sniper_ref else 0
-    peak_xs = [t.peak_x for t in tracked.values()]
-    best_live = f"{max(peak_xs):.1f}X" if peak_xs else "none"
+    peak_xs    = [t.peak_x for t in tracked.values()]
+    best_live  = f"{max(peak_xs):.1f}X" if peak_xs else "none"
     return "\n".join([
-        "⚡ <b>BOT STATUS</b>",
-        "",
+        "⚡ <b>BOT STATUS</b>", "",
         f"🟢 Online:        <b>{hours}h {mins}m</b>",
         f"🎯 Alerts fired:  <b>{total_alerts_fired}</b>",
         f"👁 Tracking now:  <b>{active} tokens</b>",
@@ -314,24 +412,9 @@ def format_narratives() -> str:
         return "📡 <b>ACTIVE NARRATIVES</b>\n\nNone loaded."
     lines = ["📡 <b>ACTIVE NARRATIVES</b>", ""]
     for n in active[:20]:
-        bar = "█" * int(n["score"]) + "░" * (10 - int(n["score"]))
         lines.append(f"<b>{n['keyword'].upper()}</b>  {n['score']:.1f}/10  [{n['category']}]")
     lines.append(f"\n<i>{len(active)} narratives active</i>")
     return "\n".join(lines)
-
-
-def format_help() -> str:
-    return "\n".join([
-        "🤖 <b>SNIPER COMMANDS</b>",
-        "",
-        "/status       — bot health + live stats",
-        "/leaderboard  — 24h leaderboard",
-        "/weekly       — 7 day leaderboard",
-        "/monthly      — 30 day leaderboard",
-        "/narratives   — active narrative list",
-        "/tracking     — tokens being tracked now",
-        "/help         — this menu",
-    ])
 
 
 def format_tracking() -> str:
@@ -339,7 +422,7 @@ def format_tracking() -> str:
         return "👁 <b>TRACKING</b>\n\nNo tokens being tracked right now."
     lines = [f"👁 <b>TRACKING ({len(tracked)} tokens)</b>", ""]
     for t in sorted(tracked.values(), key=lambda x: x.peak_x, reverse=True):
-        age = int((utcnow() - t.added_at).total_seconds() / 60)
+        age      = int((utcnow() - t.added_at).total_seconds() / 60)
         migrated = "🎓" if t.migrated else ""
         lines.append(
             f"<b>{t.name}</b> <code>${t.symbol}</code> {migrated}\n"
@@ -350,58 +433,114 @@ def format_tracking() -> str:
     return "\n".join(lines)
 
 
-# ─── Command Handler ──────────────────────────────────────────────────────────
+def format_help() -> str:
+    return "\n".join([
+        "🤖 <b>SNIPER COMMANDS</b>", "",
+        "/status          — bot health + live stats",
+        "/leaderboard     — 24h leaderboard",
+        "/weekly          — 7 day leaderboard",
+        "/monthly         — 30 day leaderboard",
+        "/narratives      — active narrative list",
+        "/tracking        — tokens being tracked now",
+        "/rug CA          — instant rug check on any token",
+        "/help            — this menu",
+    ])
 
-async def handle_commands():
-    """Poll Telegram for incoming commands and respond."""
-    offset = 0
-    log.info("[CMD] Command listener started")
 
-    while True:
-        try:
-            updates = await get_telegram_updates(offset)
-            for update in updates:
-                offset = update["update_id"] + 1
-                msg = update.get("message", {})
-                text = msg.get("text", "").strip().lower()
-                chat_id = str(msg.get("chat", {}).get("id", ""))
+# ─── Rug Analysis ─────────────────────────────────────────────────────────────
 
-                if not text.startswith("/"):
-                    continue
+async def analyze_ca(mint: str) -> str:
+    """Full rug + stats analysis on any CA."""
+    if len(mint) < 32 or len(mint) > 44:
+        return "❌ Invalid contract address."
 
-                log.info(f"[CMD] Received: {text} from {chat_id}")
+    data = await enrich_token(mint, "Unknown", "???", "unknown")
 
-                if text.startswith("/status"):
-                    await send_telegram(format_status(), chat_id)
+    from core.rug_analyzer import RugAnalyzer
+    report = RugAnalyzer().analyze_manual(data)
 
-                elif text.startswith("/leaderboard"):
-                    cutoff = utcnow() - timedelta(days=1)
-                    records = _get_records_since(cutoff)
-                    await send_telegram(format_leaderboard(records, "24H"), chat_id)
+    rug_score  = report.rug_score
+    flags      = report.flags
+    verdict    = report.verdict
 
-                elif text.startswith("/weekly"):
-                    cutoff = utcnow() - timedelta(days=7)
-                    records = _get_records_since(cutoff)
-                    await send_telegram(format_leaderboard(records, "WEEKLY"), chat_id)
+    if rug_score <= 2.5:    rug_color = "🟢"
+    elif rug_score <= 4.5:  rug_color = "🟡"
+    elif rug_score <= 6.5:  rug_color = "🟠"
+    else:                   rug_color = "🔴"
 
-                elif text.startswith("/monthly"):
-                    cutoff = utcnow() - timedelta(days=30)
-                    records = _get_records_since(cutoff)
-                    await send_telegram(format_leaderboard(records, "MONTHLY"), chat_id)
+    liq        = data.get("liquidity_usd", 0)
+    mcap       = data.get("mcap_usd", 0)
+    holders    = data.get("total_holders", 0)
+    vol1h      = data.get("volume_1h_usd", 0)
+    vol5m      = data.get("volume_5m_usd", 0)
+    pc1h       = data.get("price_change_1h_pct", 0)
+    pc5m       = data.get("price_change_5m_pct", 0)
+    buy_sell   = data.get("buy_sell_ratio_1h", 1.0)
+    top1       = data.get("top1_pct", 0)
+    top10      = data.get("top10_pct", 0)
+    dev_holds  = data.get("dev_holds_pct", 0)
+    mint_rev   = data.get("mint_authority_revoked", False)
+    freeze_rev = data.get("freeze_authority_revoked", False)
+    lp_locked  = data.get("lp_locked", False)
+    lp_burned  = data.get("lp_burned", False)
 
-                elif text.startswith("/narratives"):
-                    await send_telegram(format_narratives(), chat_id)
+    dev_status  = "✅ Sold" if dev_holds == 0 else (f"🟡 Holds {dev_holds:.1f}%" if dev_holds <= 2 else f"🔴 Holds {dev_holds:.1f}%")
+    top10_status = f"✅ {top10:.1f}%" if top10 <= 30 else (f"🟡 {top10:.1f}%" if top10 <= 50 else f"🔴 {top10:.1f}%")
+    top1_status  = f"✅ {top1:.1f}%" if top1 <= 5 else (f"🟡 {top1:.1f}%" if top1 <= 10 else f"🔴 {top1:.1f}%")
+    lp_status    = "✅ Burned" if lp_burned else ("🟡 Locked" if lp_locked else "🔴 Unlocked")
+    pc1h_str     = f"{'📈' if pc1h >= 0 else '📉'} {pc1h:+.1f}%"
+    pc5m_str     = f"{'📈' if pc5m >= 0 else '📉'} {pc5m:+.1f}%"
 
-                elif text.startswith("/tracking"):
-                    await send_telegram(format_tracking(), chat_id)
+    critical_flags = [f for f in flags if f.severity == "critical"]
+    high_flags     = [f for f in flags if f.severity == "high"]
+    med_flags      = [f for f in flags if f.severity == "medium"]
 
-                elif text.startswith("/help"):
-                    await send_telegram(format_help(), chat_id)
+    flag_lines = []
+    for f in critical_flags:
+        flag_lines.append(f"  🔴 <b>{f.code}</b> — {f.description}")
+    for f in high_flags:
+        flag_lines.append(f"  🟡 <b>{f.code}</b> — {f.description}")
+    for f in med_flags:
+        flag_lines.append(f"  🟠 <b>{f.code}</b> — {f.description}")
+    if not flag_lines:
+        flag_lines = ["  ✅ Clean — no flags"]
 
-        except Exception as e:
-            log.error(f"[CMD] Error: {e}")
-
-        await asyncio.sleep(2)
+    lines = [
+        f"{rug_color} <b>RUG SCORE: {rug_score}/10  {verdict}</b>",
+        f"",
+        f"<code>{mint}</code>",
+        f"",
+        f"📊 <b>Stats</b>",
+        f"├ MC       <b>${mcap:,.0f}</b>",
+        f"├ Vol 5m   <b>${vol5m:,.0f}</b>",
+        f"├ Vol 1h   <b>${vol1h:,.0f}</b>",
+        f"├ LP       <b>${liq:,.0f}</b>  {lp_status}",
+        f"├ 5m       {pc5m_str}",
+        f"├ 1h       {pc1h_str}",
+        f"└ B/S      <b>{buy_sell:.1f}x</b>",
+        f"",
+        f"👥 <b>Holders</b>",
+        f"├ Total    <b>{holders:,}</b>",
+        f"├ Top 1    {top1_status}",
+        f"├ Top 10   {top10_status}",
+        f"└ Dev      {dev_status}",
+        f"",
+        f"🔐 <b>Security</b>",
+        f"├ Mint     <b>{'✅ Revoked' if mint_rev else '⛔ ACTIVE'}</b>",
+        f"├ Freeze   <b>{'✅ Revoked' if freeze_rev else '⛔ ACTIVE'}</b>",
+        f"└ LP       <b>{lp_status}</b>",
+        f"",
+        f"⚠️ <b>Flags</b>",
+        *flag_lines,
+        f"",
+        f"🔗 <a href='https://dexscreener.com/solana/{mint}'>DEX</a>  "
+        f"<a href='https://solscan.io/token/{mint}'>SOL</a>  "
+        f"<a href='https://pump.fun/{mint}'>PUMP</a>  "
+        f"<a href='https://birdeye.so/token/{mint}?chain=solana'>BIRD</a>",
+        f"",
+        f"<i>🕐 {utcnow().strftime('%H:%M:%S UTC')}</i>",
+    ]
+    return "\n".join(lines)
 
 
 # ─── MCap Fetcher ─────────────────────────────────────────────────────────────
@@ -462,7 +601,7 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> dict
                     mc        = float(data.get("mc") or 0)
                     pc1h      = float(data.get("priceChange1hPercent") or 0)
                     pc5m      = float(data.get("priceChange5mPercent") or 0)
-                    log.info(f"  ↳ Birdeye: liq=${liquidity:,.0f} vol1h=${v1h:,.0f} holders={holders}")
+                    log.info(f"  -> Birdeye: liq=${liquidity:,.0f} vol1h=${v1h:,.0f} holders={holders}")
                     base["liquidity_usd"]       = liquidity
                     base["mcap_usd"]            = mc
                     base["volume_1h_usd"]       = v1h
@@ -523,14 +662,14 @@ async def track_tokens():
                 if migrated and not token.migrated:
                     token.migrated = True
                     token.status   = "migrated"
-                    log.info(f"[TRACKER] 🎓 MIGRATION: {token.symbol}")
+                    log.info(f"[TRACKER] MIGRATION: {token.symbol}")
                     await send_telegram(format_migration_alert(token, current_mcap))
                 if token.entry_mcap > 0:
                     multiplier = current_mcap / token.entry_mcap
                     for x in X_MILESTONES:
                         if multiplier >= x and x not in token.alerted_xs:
                             token.alerted_xs.add(x)
-                            log.info(f"[TRACKER] 🚀 {x}X: {token.symbol}")
+                            log.info(f"[TRACKER] {x}X: {token.symbol}")
                             await send_telegram(format_x_alert(token, current_mcap, x))
             except Exception as e:
                 log.error(f"[TRACKER] Error {mint}: {e}")
@@ -550,17 +689,17 @@ async def leaderboard_scheduler():
             last_daily = now
             records = _get_records_since(now - timedelta(days=1))
             await send_telegram(format_leaderboard(records, "24H"))
-            log.info(f"[LB] Posted 24h leaderboard")
+            log.info("[LB] Posted 24h leaderboard")
         if (now - last_weekly).total_seconds() >= 604800:
             last_weekly = now
             records = _get_records_since(now - timedelta(days=7))
             await send_telegram(format_leaderboard(records, "WEEKLY"))
-            log.info(f"[LB] Posted weekly leaderboard")
+            log.info("[LB] Posted weekly leaderboard")
         if (now - last_monthly).total_seconds() >= 2592000:
             last_monthly = now
             records = _get_records_since(now - timedelta(days=30))
             await send_telegram(format_leaderboard(records, "MONTHLY"))
-            log.info(f"[LB] Posted monthly leaderboard")
+            log.info("[LB] Posted monthly leaderboard")
 
 
 def _get_records_since(cutoff: datetime) -> list[dict]:
@@ -576,6 +715,96 @@ def _get_records_since(cutoff: datetime) -> list[dict]:
         except Exception:
             pass
     return records
+
+
+# ─── Command + Callback Handler ───────────────────────────────────────────────
+
+async def handle_commands():
+    offset = 0
+    log.info("[CMD] Command listener started")
+
+    while True:
+        try:
+            updates = await get_telegram_updates(offset)
+            for update in updates:
+                offset = update["update_id"] + 1
+
+                # ── Callback queries (button presses) ────────────────────────
+                if "callback_query" in update:
+                    cb       = update["callback_query"]
+                    cb_id    = cb["id"]
+                    cb_data  = cb.get("data", "")
+                    cb_chat  = str(cb["message"]["chat"]["id"])
+                    cb_msg   = cb["message"]["message_id"]
+
+                    if cb_data.startswith("rug_refresh:"):
+                        mint = cb_data.split(":", 1)[1]
+                        await answer_callback(cb_id, "Refreshing...")
+                        log.info(f"[CMD] Refresh rug: {mint[:12]}...")
+                        new_text = await analyze_ca(mint)
+                        await edit_telegram_message(cb_chat, cb_msg, new_text, rug_buttons(mint))
+
+                    elif cb_data.startswith("rug_delete:"):
+                        mint = cb_data.split(":", 1)[1]
+                        await answer_callback(cb_id, "Deleted")
+                        await delete_telegram_message(cb_chat, cb_msg)
+                        log.info(f"[CMD] Deleted rug msg: {mint[:12]}...")
+
+                    continue
+
+                # ── Text commands ─────────────────────────────────────────────
+                msg     = update.get("message", {})
+                text    = msg.get("text", "").strip().lower()
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+
+                if not text.startswith("/"):
+                    continue
+
+                log.info(f"[CMD] {text} from {chat_id}")
+
+                if text.startswith("/status"):
+                    await send_telegram(format_status(), chat_id)
+
+                elif text.startswith("/leaderboard"):
+                    cutoff = utcnow() - timedelta(days=1)
+                    await send_telegram(format_leaderboard(_get_records_since(cutoff), "24H"), chat_id)
+
+                elif text.startswith("/weekly"):
+                    cutoff = utcnow() - timedelta(days=7)
+                    await send_telegram(format_leaderboard(_get_records_since(cutoff), "WEEKLY"), chat_id)
+
+                elif text.startswith("/monthly"):
+                    cutoff = utcnow() - timedelta(days=30)
+                    await send_telegram(format_leaderboard(_get_records_since(cutoff), "MONTHLY"), chat_id)
+
+                elif text.startswith("/narratives"):
+                    await send_telegram(format_narratives(), chat_id)
+
+                elif text.startswith("/tracking"):
+                    await send_telegram(format_tracking(), chat_id)
+
+                elif text.startswith("/help"):
+                    await send_telegram(format_help(), chat_id)
+
+                elif text.startswith("/rug"):
+                    parts = text.split()
+                    if len(parts) < 2:
+                        await send_telegram(
+                            "⚠️ Usage: <code>/rug CONTRACT_ADDRESS</code>",
+                            chat_id
+                        )
+                    else:
+                        mint = parts[1].strip()
+                        await send_telegram(f"🔍 Analyzing <code>{mint}</code>...", chat_id)
+                        result = await analyze_ca(mint)
+                        msg_id = await send_telegram_with_buttons(result, rug_buttons(mint), chat_id)
+                        if msg_id:
+                            rug_message_map[mint] = {"message_id": msg_id, "chat_id": chat_id}
+
+        except Exception as e:
+            log.error(f"[CMD] Error: {e}")
+
+        await asyncio.sleep(2)
 
 
 # ─── Bot Loop ─────────────────────────────────────────────────────────────────
@@ -596,10 +825,10 @@ async def run_bot():
     log.info("=" * 50)
     log.info("  SOLANA_NARRATIVE_SNIPER — BOT ONLINE")
     log.info(f"  Threshold: {ALERT_THRESHOLD}  MinLP: ${MIN_LIQUIDITY:,.0f}")
-    log.info(f"  Telegram: {'✓' if TELEGRAM_BOT_TOKEN else '✗'}")
-    log.info(f"  Helius: {'✓' if HELIUS_API_KEY else '✗'}  Birdeye: {'✓' if BIRDEYE_API_KEY else '✗'}")
+    log.info(f"  Telegram: {'on' if TELEGRAM_BOT_TOKEN else 'off'}")
+    log.info(f"  Helius: {'on' if HELIUS_API_KEY else 'off'}  Birdeye: {'on' if BIRDEYE_API_KEY else 'off'}")
     log.info(f"  Milestones: {X_MILESTONES}x | Leaderboard: 24h/weekly/monthly")
-    log.info(f"  Commands: /status /leaderboard /weekly /monthly /narratives /tracking /help")
+    log.info(f"  Commands: /rug /status /leaderboard /weekly /monthly /narratives /tracking /help")
     log.info("=" * 50)
 
     await send_telegram(
@@ -607,7 +836,7 @@ async def run_bot():
         f"Threshold: {ALERT_THRESHOLD}/10\n"
         f"Tracking: {X_MILESTONES}x + migrations\n"
         f"Leaderboard: 24h / weekly / monthly\n"
-        f"Commands: /status /leaderboard /help\n"
+        f"Commands: /rug /status /leaderboard /help\n"
         f"<i>Watching Pump.fun live...</i>"
     )
 
@@ -634,7 +863,7 @@ async def _listen(sniper):
         PUMP_WS_URL, ping_interval=20, ping_timeout=10
     ) as ws:
         await ws.send(json.dumps({"method": "subscribeNewToken"}))
-        log.info("✓ Subscribed to new token stream")
+        log.info("Subscribed to new token stream")
         async for raw in ws:
             try:
                 msg = json.loads(raw)
@@ -660,7 +889,7 @@ async def handle(sniper, msg: dict):
     log.info(f"New: {name} (${symbol}) {mint[:12]}...")
     quick = sniper.narrative_engine.match_token_to_narrative(name, symbol, desc)
     if not quick["matched"]:
-        log.info(f"  ↳ No narrative match — skip")
+        log.info(f"  -> No narrative match — skip")
         return
 
     await asyncio.sleep(30)
@@ -668,29 +897,29 @@ async def handle(sniper, msg: dict):
     token_data["description"] = desc
 
     if token_data["liquidity_usd"] == 0:
-        log.info(f"  ↳ No liquidity yet — retrying in 60s")
+        log.info(f"  -> No liquidity yet — retrying in 60s")
         await asyncio.sleep(60)
         token_data = await enrich_token(mint, name, symbol, deployer)
         token_data["description"] = desc
 
     if token_data["liquidity_usd"] == 0:
-        log.info(f"  ↳ No liquidity after retry — skip")
+        log.info(f"  -> No liquidity after retry — skip")
         return
 
     if token_data["top1_pct"] > 5:
-        log.info(f"  ↳ Single holder {token_data['top1_pct']:.1f}% > 5% — skip")
+        log.info(f"  -> Single holder {token_data['top1_pct']:.1f}% > 5% — skip")
         return
     if token_data["top10_pct"] > 30:
-        log.info(f"  ↳ Top10 {token_data['top10_pct']:.1f}% > 30% — skip")
+        log.info(f"  -> Top10 {token_data['top10_pct']:.1f}% > 30% — skip")
         return
 
     alert = sniper.analyze_token(token_data)
     entry_score = alert.entry.get("final_score", 0)
-    log.info(f"  ↳ Entry: {entry_score}/10  Rug: {alert.rug.get('rug_score',10)}/10  {alert.entry.get('verdict','')}")
+    log.info(f"  -> Entry: {entry_score}/10  Rug: {alert.rug.get('rug_score',10)}/10  {alert.entry.get('verdict','')}")
 
     if entry_score >= ALERT_THRESHOLD:
         total_alerts_fired += 1
-        log.info(f"  🚨 FIRING — tracking {symbol}")
+        log.info(f"  FIRING — tracking {symbol}")
         await send_telegram(format_alert(alert))
         entry_mcap = token_data.get("mcap_usd", 0)
         if entry_mcap > 0:
