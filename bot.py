@@ -38,15 +38,14 @@ async def send_telegram(text: str):
         print(text)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(url, json=payload)
+            resp = await client.post(url, json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            })
             if resp.status_code != 200:
                 log.error(f"Telegram error: {resp.text}")
     except Exception as e:
@@ -58,45 +57,41 @@ def format_alert(alert) -> str:
     r = alert.rug
     t = alert.token
     n = alert.narrative
-
     entry_score = e.get("final_score", 0)
     rug_score   = r.get("rug_score", 10)
-    verdict     = e.get("verdict", "")
-    rug_verdict = r.get("verdict", "")
     flags       = r.get("flags", [])
     flag_str    = "  ".join([f"⛔ {f['code']}" for f in flags[:3]]) if flags else "✅ None"
-    narrative_kw = (n.get("narrative") or {}).get("keyword", "NONE")
-    comps = e.get("components", {})
+    nar         = n.get("narrative") or {}
+    narrative_kw = nar.get("keyword", "NONE").upper()
+    comps        = e.get("components", {})
 
     lines = [
-        f"🎯 <b>SNIPER ALERT</b>",
-        f"",
+        "🎯 <b>SNIPER ALERT</b>",
+        "",
         f"<b>{t.get('name','?')}</b>  <code>${t.get('symbol','?')}</code>",
         f"<code>{t.get('mint', 'N/A')}</code>",
-        f"",
-        f"📊 <b>ENTRY:  {entry_score}/10  {verdict}</b>",
-        f"🔒 <b>RUG:    {rug_score}/10  {rug_verdict}</b>",
-        f"",
-        f"📡 Narrative:  <b>{narrative_kw.upper()}</b>  ({n.get('narrative_score',0):.1f}/10)",
+        "",
+        f"📊 <b>ENTRY:  {entry_score}/10  {e.get('verdict','')}</b>",
+        f"🔒 <b>RUG:    {rug_score}/10  {r.get('verdict','')}</b>",
+        "",
+        f"📡 Narrative:  <b>{narrative_kw}</b>  ({n.get('narrative_score',0):.1f}/10)",
         f"💧 Liquidity:  <b>${t.get('liquidity_usd',0):,.0f}</b>",
         f"👥 Holders:    <b>{t.get('total_holders',0)}</b>",
         f"⏱ Age:        <b>{t.get('age_hours',0):.1f}h</b>",
         f"📈 Vol 1h:     <b>${t.get('volume_1h_usd',0):,.0f}</b>",
-        f"",
+        "",
         f"NAR {comps.get('narrative',{}).get('score','?')}  "
         f"TIM {comps.get('timing',{}).get('score','?')}  "
         f"HOL {comps.get('holders',{}).get('score','?')}  "
         f"DEP {comps.get('deployer',{}).get('score','?')}  "
         f"MOM {comps.get('momentum',{}).get('score','?')}",
-        f"",
+        "",
         f"<b>Flags:</b> {flag_str}",
     ]
-
     if e.get("signals"):
         lines += [""] + [f"✅ {s}" for s in e["signals"][:3]]
     if e.get("warnings"):
         lines += [f"⚠️ {w}" for w in e["warnings"][:3]]
-
     lines += [
         "",
         f"🔗 <a href='https://pump.fun/{t.get('mint','')}'>pump.fun</a>  "
@@ -110,17 +105,18 @@ def format_alert(alert) -> str:
 async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> dict:
     base = {
         "mint": mint, "name": name, "symbol": symbol, "deployer": deployer,
-        "age_hours": 0.02, "mcap_usd": 0, "liquidity_usd": 0,
-        "total_holders": 1, "top1_pct": 50.0, "top5_pct": 70.0,
+        "age_hours": 0.5, "mcap_usd": 0, "liquidity_usd": 0,
+        "total_holders": 50, "top1_pct": 50.0, "top5_pct": 70.0,
         "top10_pct": 80.0, "dev_holds_pct": 20.0, "wallet_clusters": 0,
         "holder_growth_1h": 0, "mint_authority_revoked": True,
         "freeze_authority_revoked": True, "lp_burned": False,
-        "lp_locked": True, "pool_age_hours": 0.0, "deployer_age_days": 0,
+        "lp_locked": True, "pool_age_hours": 0.5, "deployer_age_days": 30,
         "deployer_prev_tokens": [], "deployer_prev_rugs": [],
         "volume_5m_usd": 0, "volume_1h_usd": 0,
         "price_change_5m_pct": 0, "price_change_1h_pct": 0,
         "buy_sell_ratio_1h": 1.0, "market_conditions": "neutral",
     }
+
     if BIRDEYE_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=8) as client:
@@ -130,38 +126,44 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> dict
                     headers={"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana"}
                 )
                 if resp.status_code == 200:
-                    data = resp.json().get("data", {})
-                    base.update({
-                        if resp.status_code == 200:
-                data = resp.json().get("data", {})
-                log.info(f"  ↳ Birdeye data: liq={data.get('liquidity')} vol={data.get('v1hUSD')} holders={data.get('holder')}")
-                base.update({
-                        "mcap_usd": data.get("mc", 0) or 0,
-                        "liquidity_usd": data.get("liquidity", 0) or 0,
-                        "volume_1h_usd": data.get("v1hUSD", 0) or 0,
-                        "volume_5m_usd": data.get("v5mUSD", 0) or 0,
-                        "price_change_1h_pct": data.get("priceChange1hPercent", 0) or 0,
-                        "price_change_5m_pct": data.get("priceChange5mPercent", 0) or 0,
-                        "buy_sell_ratio_1h": (data.get("buy1h", 1) / max(data.get("sell1h", 1), 1)),
-                        "total_holders": data.get("holder", 1) or 1,
-                    })
+                    data = resp.json().get("data") or {}
+                    liquidity = float(data.get("liquidity") or 0)
+                    v1h = float(data.get("v1hUSD") or 0)
+                    v5m = float(data.get("v5mUSD") or 0)
+                    buy1h = int(data.get("buy1h") or 1)
+                    sell1h = int(data.get("sell1h") or 1)
+                    holders = int(data.get("holder") or 50)
+                    mc = float(data.get("mc") or 0)
+                    pc1h = float(data.get("priceChange1hPercent") or 0)
+                    pc5m = float(data.get("priceChange5mPercent") or 0)
+                    log.info(f"  ↳ Birdeye: liq=${liquidity:,.0f} vol1h=${v1h:,.0f} holders={holders}")
+                    base["liquidity_usd"] = liquidity
+                    base["mcap_usd"] = mc
+                    base["volume_1h_usd"] = v1h
+                    base["volume_5m_usd"] = v5m
+                    base["price_change_1h_pct"] = pc1h
+                    base["price_change_5m_pct"] = pc5m
+                    base["buy_sell_ratio_1h"] = buy1h / max(sell1h, 1)
+                    base["total_holders"] = holders
+                    base["lp_locked"] = liquidity > 5000
         except Exception as e:
             log.warning(f"Birdeye error: {e}")
-    base["lp_locked"] = base["liquidity_usd"] > 5000
+
     if HELIUS_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=8) as client:
                 resp = await client.post(
                     f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
-                    json={"jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
+                    json={"jsonrpc": "2.0", "id": 1,
+                          "method": "getAccountInfo",
                           "params": [mint, {"encoding": "jsonParsed"}]}
                 )
                 if resp.status_code == 200:
-                    result = resp.json().get("result") or {}
-                    value = result.get("value") or {}
-                    data = value.get("data") or {}
-                    parsed = data.get("parsed") or {}
-                    info = parsed.get("info") or {}
+                    result  = resp.json().get("result") or {}
+                    value   = result.get("value") or {}
+                    data    = value.get("data") or {}
+                    parsed  = data.get("parsed") or {}
+                    info    = parsed.get("info") or {}
                     if info:
                         base["mint_authority_revoked"] = info.get("mintAuthority") is None
                         base["freeze_authority_revoked"] = info.get("freezeAuthority") is None
@@ -173,7 +175,6 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> dict
 
 async def run_bot():
     sniper = SolanaNarrativeSniper()
-
     seed = os.getenv("SEED_NARRATIVES", "")
     if seed:
         for item in seed.split("|"):
@@ -238,20 +239,21 @@ async def handle(sniper, msg: dict):
         log.info(f"  ↳ No narrative match — skip")
         return
 
+    # Wait for token to settle on-chain
     await asyncio.sleep(30)
     token_data = await enrich_token(mint, name, symbol, deployer)
     token_data["description"] = desc
 
-    # If no liquidity yet, wait and retry once
+    # Retry if no liquidity yet
     if token_data["liquidity_usd"] == 0:
-        log.info(f"  ↳ No liquidity yet — waiting 60s and retrying")
+        log.info(f"  ↳ No liquidity yet — retrying in 60s")
         await asyncio.sleep(60)
         token_data = await enrich_token(mint, name, symbol, deployer)
         token_data["description"] = desc
 
-    # Skip if still no liquidity
+    # Skip if still dead
     if token_data["liquidity_usd"] == 0:
-        log.info(f"  ↳ Still no liquidity after retry — skip")
+        log.info(f"  ↳ No liquidity after retry — skip")
         return
 
     alert = sniper.analyze_token(token_data)
