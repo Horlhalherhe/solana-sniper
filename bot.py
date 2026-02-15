@@ -847,7 +847,6 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> dict
     return base
 
 async def fetch_liquidity_only(mint: str) -> float:
-    """Quick liquidity check without full enrichment"""
     if not BIRDEYE_API_KEY:
         return 0.0
     try:
@@ -857,6 +856,8 @@ async def fetch_liquidity_only(mint: str) -> float:
                 params={"address": mint},
                 headers={"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana"}
             )
+            if resp.status_code == 400:
+                return -1.0   # Signal: skip immediately, don't retry
             if resp.status_code == 200:
                 return float(resp.json().get("data", {}).get("liquidity", 0))
     except Exception:
@@ -1251,9 +1252,18 @@ async def handle_token(sniper, msg: dict):
         
         if i == 0:
             token_data = await enrich_token(mint, name, symbol, deployer)
+            if token_data.get("liquidity_usd") == 0:
+                # Quick check if Birdeye rejects this address entirely
+                test = await fetch_liquidity_only(mint)
+                if test == -1.0:
+                    log.info(f"  -> Birdeye rejected address — skip")
+                    return
         else:
             liq = await fetch_liquidity_only(mint)
-            if liq > 0:
+            if liq == -1.0:
+                log.info(f"  -> Birdeye rejected address — skip")
+                return
+            elif liq > 0:
                 token_data["liquidity_usd"] = liq
             else:
                 continue
