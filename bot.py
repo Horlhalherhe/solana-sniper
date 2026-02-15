@@ -543,6 +543,10 @@ async def handle(sniper, msg: dict):
     if not quick["matched"]:
         log.info(f"  ↳ No narrative match — skip")
         return
+    # Validate mint address before API calls
+    if len(mint) < 32 or len(mint) > 44:
+        log.info(f"  ↳ Invalid mint address — skip")
+        return
 
     await asyncio.sleep(30)
     token_data = await enrich_token(mint, name, symbol, deployer)
