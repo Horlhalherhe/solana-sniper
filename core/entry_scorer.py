@@ -112,12 +112,11 @@ class EntryScorer:
         if d.total_holders < 50:        score -= 3.0
         elif d.total_holders < 200:     score -= 1.5
         elif d.total_holders > 1000:    score += 1.0
-        if d.top10_pct > 80:            score -= 4.0
-        elif d.top10_pct > 60:          score -= 2.5
-        elif d.top10_pct > 40:          score -= 1.0
-        elif d.top10_pct < 25:          score += 1.0
-        if d.dev_holds_pct > 15:        score -= 2.0
-        elif d.dev_holds_pct < 5:       score += 0.5
+        if d.top10_pct > 30:            score -= 5.0
+        elif d.top10_pct > 20:          score -= 2.0
+        elif d.top10_pct <= 30:         score += 2.0
+        if d.top1_pct > 5:              score -= 5.0
+        elif d.top1_pct <= 5:           score += 2.0
         if d.wallet_clusters > 3:       score -= 2.5
         elif d.wallet_clusters > 0:     score -= 1.0
         if d.holder_growth_1h > 50:     score += 1.5
