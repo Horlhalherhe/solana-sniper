@@ -10,7 +10,10 @@ import json
 import os
 import sys
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+def utcnow():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 from pathlib import Path
 from collections import defaultdict
 
@@ -56,7 +59,7 @@ class TrackedToken:
         self.peak_x      = 1.0
         self.alerted_xs  = set()
         self.migrated    = False
-        self.added_at    = datetime.utcnow()
+        self.added_at    = utcnow()
         self.status      = "active"   # active | migrated | dead
 
     def current_x(self):
@@ -175,7 +178,7 @@ def format_alert(alert) -> str:
         f"🔗 <a href='https://pump.fun/{t.get('mint','')}'>pump.fun</a>  "
         f"<a href='https://dexscreener.com/solana/{t.get('mint','')}'>dexscreener</a>  "
         f"<a href='https://solscan.io/token/{t.get('mint','')}'>solscan</a>",
-        f"<i>🕐 {datetime.utcnow().strftime('%H:%M:%S UTC')}</i>",
+        f"<i>🕐 {utcnow().strftime('%H:%M:%S UTC')}</i>",
     ]
     return "\n".join(lines)
 
@@ -194,7 +197,7 @@ def format_x_alert(token: TrackedToken, current_mcap: float, multiplier: int) ->
         "",
         f"🔗 <a href='https://dexscreener.com/solana/{token.mint}'>dexscreener</a>  "
         f"<a href='https://pump.fun/{token.mint}'>pump.fun</a>",
-        f"<i>🕐 {datetime.utcnow().strftime('%H:%M:%S UTC')}</i>",
+        f"<i>🕐 {utcnow().strftime('%H:%M:%S UTC')}</i>",
     ])
 
 
@@ -212,7 +215,7 @@ def format_migration_alert(token: TrackedToken, current_mcap: float) -> str:
         "",
         f"🔗 <a href='https://dexscreener.com/solana/{token.mint}'>dexscreener</a>  "
         f"<a href='https://raydium.io/swap/?inputCurrency=sol&outputCurrency={token.mint}'>raydium</a>",
-        f"<i>🕐 {datetime.utcnow().strftime('%H:%M:%S UTC')}</i>",
+        f"<i>🕐 {utcnow().strftime('%H:%M:%S UTC')}</i>",
     ])
 
 
@@ -272,7 +275,7 @@ def format_leaderboard(records: list[dict], period: str) -> str:
         f"10X+:         <b>{moon_shots}</b>",
         f"Migrations:   <b>{migrants}</b>",
         f"",
-        f"<i>🕐 {datetime.utcnow().strftime('%d %b %Y %H:%M UTC')}</i>",
+        f"<i>🕐 {utcnow().strftime('%d %b %Y %H:%M UTC')}</i>",
     ]
     return "\n".join(lines)
 
@@ -379,7 +382,7 @@ async def track_tokens():
             continue
         for mint in list(tracked.keys()):
             token = tracked[mint]
-            age_hours = (datetime.utcnow() - token.added_at).total_seconds() / 3600
+            age_hours = (utcnow() - token.added_at).total_seconds() / 3600
             if age_hours > 24:
                 leaderboard_history.append(token.to_record())
                 del tracked[mint]
@@ -417,13 +420,13 @@ async def track_tokens():
 
 async def leaderboard_scheduler():
     """Posts leaderboard on schedule: 24h, weekly, monthly."""
-    last_daily   = datetime.utcnow()
-    last_weekly  = datetime.utcnow()
-    last_monthly = datetime.utcnow()
+    last_daily   = utcnow()
+    last_weekly  = utcnow()
+    last_monthly = utcnow()
 
     while True:
         await asyncio.sleep(60)
-        now = datetime.utcnow()
+        now = utcnow()
 
         # 24h leaderboard
         if (now - last_daily).total_seconds() >= 86400:
