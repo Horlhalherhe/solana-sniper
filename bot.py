@@ -558,6 +558,14 @@ async def handle(sniper, msg: dict):
         log.info(f"  ↳ No liquidity after retry — skip")
         return
 
+    # Hard holder filter
+    if token_data["top1_pct"] > 5:
+        log.info(f"  ↳ Single holder {token_data['top1_pct']:.1f}% > 5% — skip")
+        return
+    if token_data["top10_pct"] > 30:
+        log.info(f"  ↳ Top10 concentration {token_data['top10_pct']:.1f}% > 30% — skip")
+        return
+
     alert = sniper.analyze_token(token_data)
     entry_score = alert.entry.get("final_score", 0)
     log.info(f"  ↳ Entry: {entry_score}/10  Rug: {alert.rug.get('rug_score',10)}/10  {alert.entry.get('verdict','')}")
