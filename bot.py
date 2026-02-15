@@ -1,5 +1,5 @@
 """
-SOLANA_NARRATIVE_SNIPER — BOT LOOP [CORRECTED v2.1]
+SOLANA_NARRATIVE_SNIPER — BOT LOOP [CORRECTED v2.2]
 Pump.fun -> score -> Telegram alerts
 + Post-alert tracker: X multipliers + migration
 + PnL Leaderboard: 24h, weekly, monthly
@@ -7,12 +7,11 @@ Pump.fun -> score -> Telegram alerts
 + Inline buttons: Refresh / Delete on rug checks
 
 FIXES:
+- Fixed 409 Conflict: webhook deletion now happens before polling starts
 - Timezone-aware datetime (no deprecation warning)
-- Telegram 409 Conflict handled (webhook deletion)
 - Thread-safe state management
 - Memory leak prevention
 - WebSocket resilience
-- API endpoint fixes
 """
 
 import asyncio
@@ -118,7 +117,6 @@ bot_start_time: datetime = utcnow()
 total_alerts_fired: int = 0
 rug_message_map: Dict[str, dict] = {}
 rug_cache: Dict[str, Tuple[str, datetime]] = {}
-_webhook_deleted: bool = False  # Track if webhook was deleted
 
 # ─── Persistence ────────────────────────────────────────────────────────────────
 async def save_leaderboard_async():
@@ -313,29 +311,35 @@ async def answer_callback(callback_id: str, text: str = ""):
     except Exception:
         pass
 
-async def get_telegram_updates(offset: int = 0) -> list:
-    """[FIXED] Handle 409 Conflict by deleting webhook first"""
-    global _webhook_deleted
+async def delete_telegram_webhook():
+    """[NEW] Delete webhook before starting polling"""
+    if not TELEGRAM_BOT_TOKEN:
+        return False
     
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
+                json={"drop_pending_updates": True}
+            )
+            if resp.status_code == 200:
+                result = resp.json()
+                if result.get("ok"):
+                    log.info("[TG] Webhook deleted successfully")
+                    return True
+                else:
+                    log.warning(f"[TG] Webhook deletion: {result.get('description')}")
+            else:
+                log.warning(f"[TG] Webhook deletion HTTP {resp.status_code}")
+    except Exception as e:
+        log.warning(f"[TG] Webhook deletion error: {e}")
+    
+    return False
+
+async def get_telegram_updates(offset: int = 0) -> list:
+    """[FIXED] Get updates with proper error handling"""
     if not TELEGRAM_BOT_TOKEN:
         return []
-    
-    # Delete webhook on first call to prevent 409 Conflict
-    if not _webhook_deleted:
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
-                    json={"drop_pending_updates": True}
-                )
-                if resp.status_code == 200:
-                    log.info("[TG] Deleted webhook to enable polling")
-                    _webhook_deleted = True
-                    await asyncio.sleep(2)  # Wait for Telegram to process
-                else:
-                    log.debug(f"[TG] Webhook deletion response: {resp.status_code}")
-        except Exception as e:
-            log.debug(f"[TG] Webhook deletion (optional): {e}")
     
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -344,15 +348,17 @@ async def get_telegram_updates(offset: int = 0) -> list:
                 params={
                     "offset": offset,
                     "timeout": 25,
-                    "allowed_updates": json.dumps(["message", "callback_query"])
+                    "allowed_updates": ["message", "callback_query"]
                 }
             )
             if resp.status_code == 200:
                 return resp.json().get("result", [])
             elif resp.status_code == 409:
-                log.warning("[TG] 409 Conflict - retrying after delay")
-                await asyncio.sleep(3)
+                log.warning("[TG] 409 Conflict - another instance may be running")
+                await asyncio.sleep(5)
                 return []
+            else:
+                log.warning(f"[TG] HTTP {resp.status_code} in getUpdates")
     except Exception as e:
         log.debug(f"[TG] Updates error: {e}")
     return []
@@ -1110,15 +1116,20 @@ async def run_bot():
                     log.warning(f"[SEED] Invalid score for {parts[0]}")
     
     log.info("=" * 50)
-    log.info("  SOLANA_NARRATIVE_SNIPER — BOT ONLINE [CORRECTED v2.1]")
+    log.info("  SOLANA_NARRATIVE_SNIPER — BOT ONLINE [CORRECTED v2.2]")
     log.info(f"  Threshold: {ALERT_THRESHOLD}  MinLP: ${MIN_LIQUIDITY:,.0f}")
     log.info(f"  Telegram: {'on' if TELEGRAM_BOT_TOKEN else 'off'}")
     log.info(f"  Helius: {'on' if HELIUS_API_KEY else 'off'}  Birdeye: {'on' if BIRDEYE_API_KEY else 'off'}")
     log.info(f"  Concurrency: {TRACKER_CONCURRENCY}  Cache TTL: {RUG_CACHE_TTL_SECONDS}s")
     log.info("=" * 50)
     
+    # [CRITICAL FIX] Delete webhook BEFORE starting any Telegram operations
+    if TELEGRAM_BOT_TOKEN:
+        await delete_telegram_webhook()
+        await asyncio.sleep(2)  # Wait for Telegram to process
+    
     await send_telegram(
-        "🎯 <b>SOLANA_NARRATIVE_SNIPER ONLINE</b> [v2.1]\n"
+        "🎯 <b>SOLANA_NARRATIVE_SNIPER ONLINE</b> [v2.2]\n"
         f"Threshold: {ALERT_THRESHOLD}/10\n"
         f"Tracking: {X_MILESTONES}x + verified migrations\n"
         f"Leaderboard: 24h / weekly / monthly\n"
