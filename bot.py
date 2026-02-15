@@ -704,14 +704,3 @@ async def handle(sniper, msg: dict):
 
 if __name__ == "__main__":
     asyncio.run(run_bot())
-```
-
-Commit → redeploy. Then in your Telegram bot or channel type any of these:
-```
-/status       → uptime, alerts fired, live tracking
-/leaderboard  → 24h top performers
-/weekly       → 7 day leaderboard
-/monthly      → 30 day leaderboard
-/narratives   → all active narratives + scores
-/tracking     → tokens being watched right now
-/help         → command list
