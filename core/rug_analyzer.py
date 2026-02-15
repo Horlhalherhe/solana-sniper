@@ -30,8 +30,8 @@ FLAGS = {
     "LP_NOT_LOCKED":          RiskFlag("LP_NOT_LOCKED",          "critical", "Liquidity not locked or burned", 3.0),
     "LP_LOW":                 RiskFlag("LP_LOW",                 "high",     "Liquidity under $10k", 1.5),
     "LP_UNLOCK_SOON":         RiskFlag("LP_UNLOCK_SOON",         "high",     "Lock expires within 7 days", 2.0),
-    "TOP10_OVER_50":          RiskFlag("TOP10_OVER_50",          "high",     "Top 10 wallets hold >50%", 1.5),
-    "TOP1_OVER_20":           RiskFlag("TOP1_OVER_20",           "high",     "Single wallet holds >20%", 2.0),
+    "TOP10_OVER_30":          RiskFlag("TOP10_OVER_30",          "high",     "Top 10 wallets hold >30%", 2.5),
+    "TOP1_OVER_5":           RiskFlag("TOP1_OVER_5",           "high",     "Single wallet holds >3%", 3.0),
     "DEPLOYER_RUGGED_BEFORE": RiskFlag("DEPLOYER_RUGGED_BEFORE", "critical", "Deployer linked to previous rug", 3.0),
     "DEPLOYER_FRESH_WALLET":  RiskFlag("DEPLOYER_FRESH_WALLET",  "medium",   "Deployer wallet < 7 days old", 1.0),
     "WALLET_CLUSTER":         RiskFlag("WALLET_CLUSTER",         "high",     "Top holders funded from same source", 2.0),
@@ -161,10 +161,10 @@ class RugAnalyzer:
             if liquidity.lock_expiry_days is not None and liquidity.lock_expiry_days <= 7:
                 active_flags.append(FLAGS["LP_UNLOCK_SOON"])
         if holders:
-            if holders.top10_pct > 50:
-                active_flags.append(FLAGS["TOP10_OVER_50"])
-            if holders.top1_pct > 20:
-                active_flags.append(FLAGS["TOP1_OVER_20"])
+            if holders.top10_pct > 30:
+                active_flags.append(FLAGS["TOP10_OVER_30"])
+            if holders.top1_pct > 5:
+                active_flags.append(FLAGS["TOP1_OVER_5"])
             if holders.wallet_clusters_detected > 0:
                 active_flags.append(FLAGS["WALLET_CLUSTER"])
         if deployer:
