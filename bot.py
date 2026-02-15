@@ -7,7 +7,7 @@ Pump.fun -> score -> Telegram alerts
 + Inline buttons: Refresh / Delete on rug checks
 
 FIXES:
-- Fixed 409 Conflict: webhook deletion now happens before polling starts
+- Fixed 409 Conflict: webhook deletion before polling starts
 - Timezone-aware datetime (no deprecation warning)
 - Thread-safe state management
 - Memory leak prevention
@@ -43,7 +43,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 HELIUS_API_KEY     = os.getenv("HELIUS_API_KEY", "")
 BIRDEYE_API_KEY    = os.getenv("BIRDEYE_API_KEY", "")
-ALERT_THRESHOLD    = float(os.getenv("ALERT_THRESHOLD", "5.5"))
+ALERT_THRESHOLD    = float(os.getenv("ALERT_THRESHOLD", "5.0"))  # CHANGED: 5.5 -> 5.0
 MIN_LIQUIDITY      = float(os.getenv("MIN_LIQUIDITY_USD", "5000"))
 PUMP_WS_URL        = "wss://pumpportal.fun/api/data"
 X_MILESTONES       = [2, 5, 10, 25, 50, 100]
@@ -1252,11 +1252,14 @@ async def handle_token(sniper, msg: dict):
         log.info(f"  -> No liquidity after {len(delays)} attempts")
         return
     
-    if token_data["top1_pct"] > 5:
-        log.info(f"  -> Single holder {token_data['top1_pct']:.1f}% > 5%")
+    # CHANGED: top1_pct > 5 -> top1_pct > 10
+    if token_data["top1_pct"] > 10:
+        log.info(f"  -> Single holder {token_data['top1_pct']:.1f}% > 10%")
         return
-    if token_data["top10_pct"] > 30:
-        log.info(f"  -> Top10 {token_data['top10_pct']:.1f}% > 30%")
+    
+    # CHANGED: top10_pct > 30 -> top10_pct > 40
+    if token_data["top10_pct"] > 40:
+        log.info(f"  -> Top10 {token_data['top10_pct']:.1f}% > 40%")
         return
     
     alert = sniper.analyze_token(token_data)
