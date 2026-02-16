@@ -1,99 +1,70 @@
-# 🚀 Deploy Bot to Railway
+# CRITICAL FIX DEPLOYMENT
 
-## Step 1 — Push to GitHub
+## Problem
+Your deployed `core/` folder is missing the `inject_manual_narrative` method, causing the bot to crash on startup before it can even subscribe to Pump.fun.
 
-```bash
-cd solana_sniper
-git init
-git add .
-git commit -m "initial: solana narrative sniper"
-gh repo create solana-narrative-sniper --private --push --source=.
+## Solution
+Replace your entire GitHub `/core` folder with the fixed `/core_fixed` folder.
+
+## Step-by-Step
+
+### 1. In your GitHub repo, DELETE the old `/core` folder
+
+### 2. Upload the NEW `/core_fixed` folder and rename it to `/core`
+
+Files to upload:
+```
+core/__init__.py
+core/narrative_engine.py  
+core/rug_analyzer.py
+core/entry_scorer.py
+core/meta_intelligence.py
 ```
 
-Or manually create a GitHub repo and push.
+### 3. Commit and push to GitHub
 
----
+### 4. Railway will auto-deploy the fix
 
-## Step 2 — Create Railway Project
+### 5. Watch logs for these SUCCESS indicators:
 
-1. Go to **https://railway.app**
-2. Click **New Project**
-3. Select **Deploy from GitHub repo**
-4. Pick your `solana-narrative-sniper` repo
-5. Railway auto-detects Python + `Procfile`
-
----
-
-## Step 3 — Set Environment Variables
-
-In Railway dashboard → your service → **Variables** tab:
-
-| Variable | Value |
-|----------|-------|
-| `HELIUS_API_KEY` | Your Helius key |
-| `BIRDEYE_API_KEY` | Your Birdeye key |
-| `ALERT_THRESHOLD` | `5.5` |
-| `NARRATIVE_THRESHOLD` | `4.0` |
-| `SNIPER_DATA_DIR` | `/app/data` |
-
-Railway auto-sets `PORT` — **do not add it**.
-
----
-
-## Step 4 — Add a Volume (Persistent Data)
-
-So your deployer DB / token history survives redeploys:
-
-1. Railway dashboard → your service → **Volumes**
-2. Mount path: `/app/data`
-3. Done — `SNIPER_DATA_DIR=/app/data` already set above
-
----
-
-## Step 5 — Deploy
-
-Railway deploys automatically on every push to main.
-
-Your app will be live at:
 ```
-https://your-project-name.up.railway.app
+[SNIPER] Injected: openai (ai_tech) score=8.0
+[SNIPER] Injected: bear (animals) score=6.5
+[SNIPER] Injected: doge (animals) score=8.0
+...
+[SNIPER] All engines online.
+[WS] Connecting to Pump.fun...
+[WS] Subscribed to new token stream
 ```
 
-Dashboard: `https://your-project.up.railway.app/`
-API docs:  `https://your-project.up.railway.app/docs`
-Health:    `https://your-project.up.railway.app/health`
+### 6. Test narrative matching works:
 
----
+Wait for a token with "dog", "cat", "monkey", "elon", "musk", or "trump" in the name.
 
-## API Endpoints (once live)
-
-```bash
-# Feed narratives
-curl -X POST https://your-app.up.railway.app/api/narrative/feed \
-  -H "Content-Type: application/json" \
-  -d '{"texts": ["deepseek r2 going viral on CT"]}'
-
-# Inject manual narrative
-curl -X POST https://your-app.up.railway.app/api/narrative/inject \
-  -H "Content-Type: application/json" \
-  -d '{"keyword": "capybara", "category": "animals", "score": 7.5}'
-
-# Analyze token
-curl -X POST https://your-app.up.railway.app/api/token/analyze \
-  -H "Content-Type: application/json" \
-  -d '{"data": {"name":"DeepSeek AI","symbol":"DSAI","mint":"So1...","age_hours":1.5,"liquidity_usd":28000,"top10_pct":33,"mint_authority_revoked":true,"freeze_authority_revoked":true,"lp_burned":true}}'
-
-# Get active narratives
-curl https://your-app.up.railway.app/api/narrative/active
-
-# Intel summary
-curl https://your-app.up.railway.app/api/intel/summary
+You should see:
+```
+[NEW] Thief Cat ($CAT) abc123...
+  -> Source: dexscreener  liq=$1,200  mcap=$2,500
+  -> Entry: 4.5/10  Rug: 5.2/10  🟠 WEAK ENTRY
 ```
 
----
+If you see ` -> No narrative match` for tokens with those keywords, the core folder wasn't updated.
 
-## Free Tier Note
+## What Was Fixed
 
-Railway free tier: $5 credit/month.
-This app uses ~$0.01–0.05/day idle.
-Upgrade to Hobby ($5/mo) for always-on.
+1. **narrative_engine.py** - Added missing `inject_manual_narrative()` method
+2. **entry_scorer.py** - Added `top1_pct` field to `EntryInput` dataclass (was missing, causing crashes)
+3. All modules synced to latest working versions
+
+## Current Settings (for testing)
+
+```
+MIN_LIQUIDITY_USD = 500   # Very low to force alerts
+ALERT_THRESHOLD = 3.0      # Very low to force alerts
+```
+
+Once you confirm alerts are firing, raise them back to production values:
+```
+MIN_LIQUIDITY_USD = 5000
+ALERT_THRESHOLD = 5.0
+```
