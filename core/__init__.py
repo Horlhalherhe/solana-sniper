@@ -1,1 +1,1 @@
-
+"""Core analysis modules"""
