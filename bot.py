@@ -713,7 +713,6 @@ async def _listen(sniper):
                 pass
             except Exception as e:
                 log.error(f"[WS] Handler error: {e}")
-
 async def handle_token(sniper, msg: dict):
     global total_alerts_fired
 
@@ -738,30 +737,38 @@ async def handle_token(sniper, msg: dict):
         log.info(f"  -> No narrative match")
         return
 
-    # Wait 30s then enrich
+    # Wait 30s for token to settle, then enrich
     await asyncio.sleep(30)
     token_data = await enrich_token(mint, name, symbol, deployer)
     token_data["description"] = desc
 
-    # If Birdeye had no data yet, wait 60s and retry once
-    if token_data["liquidity_usd"] == 0 and token_data["mcap_usd"] == 0:
-        log.info(f"  -> No Birdeye data — retrying in 60s")
+    birdeye_ok = token_data["mcap_usd"] > 0 or token_data["liquidity_usd"] > 0
+
+    # If Birdeye had no data, wait 60s and retry once
+    if not birdeye_ok:
+        log.info(f"  -> No Birdeye data — retrying in 60s...")
         await asyncio.sleep(60)
         token_data = await enrich_token(mint, name, symbol, deployer)
         token_data["description"] = desc
+        birdeye_ok = token_data["mcap_usd"] > 0 or token_data["liquidity_usd"] > 0
 
-    # Only skip on liquidity if Birdeye actually gave us real data showing it's low
-    if token_data["mcap_usd"] > 0 and token_data["liquidity_usd"] < MIN_LIQUIDITY:
-        log.info(f"  -> Liquidity ${token_data['liquidity_usd']:,.0f} < ${MIN_LIQUIDITY:,.0f} — skip")
-        return
+    if birdeye_ok:
+        log.info(f"  -> Birdeye: liq=${token_data['liquidity_usd']:,.0f} mcap=${token_data['mcap_usd']:,.0f}")
 
-    # Holder filters
-    if token_data["top1_pct"] > 10:
-        log.info(f"  -> Top1 {token_data['top1_pct']:.1f}% > 10% — skip")
-        return
-    if token_data["top10_pct"] > 40:
-        log.info(f"  -> Top10 {token_data['top10_pct']:.1f}% > 40% — skip")
-        return
+        # Liquidity filter
+        if token_data["liquidity_usd"] < MIN_LIQUIDITY:
+            log.info(f"  -> LP ${token_data['liquidity_usd']:,.0f} below minimum — skip")
+            return
+
+        # Holder filters
+        if token_data["top1_pct"] > 10:
+            log.info(f"  -> Top1 {token_data['top1_pct']:.1f}% > 10% — skip")
+            return
+        if token_data["top10_pct"] > 40:
+            log.info(f"  -> Top10 {token_data['top10_pct']:.1f}% > 40% — skip")
+            return
+    else:
+        log.info(f"  -> Birdeye unavailable after 2 attempts — scoring with Helius data only")
 
     alert       = sniper.analyze_token(token_data)
     entry_score = alert.entry.get("final_score", 0)
@@ -771,9 +778,8 @@ async def handle_token(sniper, msg: dict):
     if entry_score >= ALERT_THRESHOLD:
         async with alerts_lock:
             total_alerts_fired += 1
-        log.info(f"  🎯 FIRING — {symbol}")
+        log.info(f"  🎯 FIRING — {name} (${symbol})")
         await send_telegram(format_alert(alert))
-
         entry_mcap = token_data.get("mcap_usd", 0)
         if entry_mcap > 0:
             nar_kw = (quick.get("narrative") or {}).get("keyword", "unknown")
