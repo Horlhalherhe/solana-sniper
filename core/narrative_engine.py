@@ -140,25 +140,39 @@ class NarrativeEngine:
             if active_kw in kw_lower or kw_lower in active_kw:
                 return narrative.final_score * 0.7
         return None
-
-    def match_token_to_narrative(self, name: str, symbol: str, description: str = "") -> dict:
-        combined = f"{name} {symbol} {description}".lower()
-        best_match = None
-        best_score = 0.0
-        best_confidence = 0.0
-        for kw, narrative in self.active_narratives.items():
-            if kw in combined:
-                confidence = 0.95 if (kw in name.lower() or kw in symbol.lower()) else 0.65
-                weighted = narrative.final_score * confidence
-                if weighted > best_score:
-                    best_score = weighted
-                    best_match = narrative
-                    best_confidence = confidence
-        if not best_match:
-            return {"matched": False, "narrative": None, "confidence": 0.0, "narrative_score": 0.0}
-        return {"matched": True, "narrative": best_match.to_dict(),
-                "confidence": round(best_confidence, 2),
-                "narrative_score": round(best_match.final_score, 2)}
+def match_token_to_narrative(self, name: str, symbol: str, description: str = "") -> dict:
+    combined = f"{name} {symbol} {description}".lower()
+    
+    # DEBUG: Log what we're checking
+    print(f"[NARRATIVE DEBUG] Checking '{name}' against {len(self.active_narratives)} narratives")
+    print(f"[NARRATIVE DEBUG] Combined text: '{combined}'")
+    
+    best_match = None
+    best_score = 0.0
+    best_confidence = 0.0
+    
+    for kw, narrative in self.active_narratives.items():
+        print(f"[NARRATIVE DEBUG] Testing keyword '{kw}' (score={narrative.final_score})")
+        if kw in combined:
+            print(f"[NARRATIVE DEBUG] ✓ MATCH FOUND: '{kw}' in '{combined}'")
+            confidence = 0.95 if (kw in name.lower() or kw in symbol.lower()) else 0.65
+            weighted = narrative.final_score * confidence
+            if weighted > best_score:
+                best_score = weighted
+                best_match = narrative
+                best_confidence = confidence
+    
+    if not best_match:
+        print(f"[NARRATIVE DEBUG] ✗ NO MATCH for '{name}'")
+        return {"matched": False, "narrative": None, "confidence": 0.0, "narrative_score": 0.0}
+    
+    print(f"[NARRATIVE DEBUG] ✓ BEST MATCH: {best_match.keyword} (score={best_match.final_score})")
+    return {
+        "matched": True,
+        "narrative": best_match.to_dict(),
+        "confidence": round(best_confidence, 2),
+        "narrative_score": round(best_match.final_score, 2)
+    }
 
     def get_active_sorted(self, min_score: float = 3.0) -> list[dict]:
         return sorted(
