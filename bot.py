@@ -1,15 +1,16 @@
 """
-SOLANA_NARRATIVE_SNIPER — BOT LOOP [v2.3]
+SOLANA_NARRATIVE_SNIPER — BOT LOOP [v2.4]
 Pump.fun -> score -> Telegram alerts
 + Post-alert tracker: X multipliers + migration
 + PnL Leaderboard: 24h, weekly, monthly
 + Telegram commands: /status /leaderboard /weekly /monthly /narratives /tracking /help
 
-FIXES v2.3:
-- WS reconnect max_delay 300s -> 30s (was offline 5min on disconnect)
-- No liquidity hard gate: tokens scored even if Birdeye returns 400
-- Proceeds with Helius-only data when Birdeye unavailable
-- Removed /rug command
+FIXES v2.4:
+- DexScreener added as fallback when Birdeye returns 400
+- DexScreener indexes pump.fun tokens within ~30s of launch (free, no key needed)
+- Tokens skipped cleanly if both Birdeye AND DexScreener unavailable
+- WS reconnect max 30s
+- No crashes on Helius-only data
 """
 
 import asyncio
@@ -36,6 +37,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("sniper-bot")
 
+# ─── Configuration ─────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 HELIUS_API_KEY     = os.getenv("HELIUS_API_KEY", "")
@@ -51,13 +53,15 @@ DATA_DIR = Path(os.getenv("SNIPER_DATA_DIR", "./data"))
 DATA_DIR.mkdir(exist_ok=True)
 LEADERBOARD_FILE = DATA_DIR / "leaderboard.json"
 
-tracked_lock  = asyncio.Lock()
-history_lock  = asyncio.Lock()
-alerts_lock   = asyncio.Lock()
+# ─── Locks ─────────────────────────────────────────────────────────────────────
+tracked_lock = asyncio.Lock()
+history_lock = asyncio.Lock()
+alerts_lock  = asyncio.Lock()
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
+# ─── Tracked Token ─────────────────────────────────────────────────────────────
 class TrackedToken:
     def __init__(self, mint, name, symbol, entry_mcap, entry_score, narrative):
         self.mint               = mint
@@ -93,23 +97,25 @@ class TrackedToken:
             "last_updated": self.last_updated.isoformat(),
         }
 
+# ─── Global State ──────────────────────────────────────────────────────────────
 tracked: Dict[str, TrackedToken] = {}
-leaderboard_history: List[dict]  = []
+leaderboard_history: List[dict] = []
 sniper_ref: Optional[SolanaNarrativeSniper] = None
 bot_start_time: datetime = utcnow()
-total_alerts_fired: int  = 0
+total_alerts_fired: int = 0
 
+# ─── Persistence ───────────────────────────────────────────────────────────────
 async def save_leaderboard_async():
     try:
         async with tracked_lock, history_lock:
             records = [t.to_record() for t in tracked.values()]
             records += leaderboard_history
             if len(records) > MAX_LEADERBOARD_HISTORY:
-                records = records[-MAX_LEADERBOARD_HISTORY // 2:]
+                records = records[-MAX_LEADERBOARD_HISTORY//2:]
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
                 None,
-                lambda: LEADERBOARD_FILE.write_text(json.dumps(records, indent=2), encoding="utf-8")
+                lambda: LEADERBOARD_FILE.write_text(json.dumps(records, indent=2), encoding='utf-8')
             )
     except Exception as e:
         log.error(f"[LB] Save error: {e}")
@@ -130,6 +136,7 @@ def load_leaderboard():
     except Exception as e:
         log.error(f"[LB] Load error: {e}")
 
+# ─── Retry Decorator ───────────────────────────────────────────────────────────
 def retry_on_429(max_retries=3, base_delay=1.0):
     def decorator(func):
         @functools.wraps(func)
@@ -153,14 +160,13 @@ def retry_on_429(max_retries=3, base_delay=1.0):
         return wrapper
     return decorator
 
+# ─── Telegram ──────────────────────────────────────────────────────────────────
 @retry_on_429(max_retries=3, base_delay=1.0)
 async def send_telegram(text: str, chat_id: str = None) -> int:
     if not TELEGRAM_BOT_TOKEN:
-        print(text)
-        return 0
+        print(text); return 0
     cid = chat_id or TELEGRAM_CHAT_ID
-    if not cid:
-        return 0
+    if not cid: return 0
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
@@ -175,8 +181,7 @@ async def send_telegram(text: str, chat_id: str = None) -> int:
     return 0
 
 async def delete_telegram_webhook():
-    if not TELEGRAM_BOT_TOKEN:
-        return
+    if not TELEGRAM_BOT_TOKEN: return False
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
@@ -185,18 +190,18 @@ async def delete_telegram_webhook():
             )
             if resp.status_code == 200 and resp.json().get("ok"):
                 log.info("[TG] Webhook deleted")
+                return True
     except Exception as e:
-        log.warning(f"[TG] Webhook error: {e}")
+        log.warning(f"[TG] Webhook deletion error: {e}")
+    return False
 
 async def get_telegram_updates(offset: int = 0) -> list:
-    if not TELEGRAM_BOT_TOKEN:
-        return []
+    if not TELEGRAM_BOT_TOKEN: return []
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
-                params={"offset": offset, "timeout": 25,
-                        "allowed_updates": ["message"]}
+                params={"offset": offset, "timeout": 25, "allowed_updates": ["message"]}
             )
             if resp.status_code == 200:
                 return resp.json().get("result", [])
@@ -207,11 +212,60 @@ async def get_telegram_updates(offset: int = 0) -> list:
         log.debug(f"[TG] Updates error: {e}")
     return []
 
+# ─── DexScreener Fetcher ───────────────────────────────────────────────────────
+async def fetch_dexscreener(mint: str) -> dict:
+    """
+    Fetch token data from DexScreener — free, no API key, indexes pump.fun fast.
+    Returns normalized dict with same keys as Birdeye enrichment, or {} on failure.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(
+                f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            if resp.status_code != 200:
+                return {}
+            pairs = resp.json().get("pairs") or []
+            if not pairs:
+                return {}
+
+            # Use the pair with highest liquidity (usually the main pool)
+            pair = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
+
+            liquidity  = float((pair.get("liquidity") or {}).get("usd") or 0)
+            fdv        = float(pair.get("fdv") or 0)
+            mc         = float(pair.get("marketCap") or fdv or 0)
+            vol_h1     = float((pair.get("volume") or {}).get("h1") or 0)
+            vol_m5     = float((pair.get("volume") or {}).get("m5") or 0)
+            pc_h1      = float((pair.get("priceChange") or {}).get("h1") or 0)
+            pc_m5      = float((pair.get("priceChange") or {}).get("m5") or 0)
+            buys_h1    = int((pair.get("txns") or {}).get("h1", {}).get("buys") or 1)
+            sells_h1   = int((pair.get("txns") or {}).get("h1", {}).get("sells") or 1)
+
+            log.info(f"  -> DexScreener: liq=${liquidity:,.0f} mcap=${mc:,.0f}")
+
+            return {
+                "liquidity_usd":        liquidity,
+                "mcap_usd":             mc,
+                "volume_1h_usd":        vol_h1,
+                "volume_5m_usd":        vol_m5,
+                "price_change_1h_pct":  pc_h1,
+                "price_change_5m_pct":  pc_m5,
+                "buy_sell_ratio_1h":    buys_h1 / max(sells_h1, 1),
+                "lp_locked":            liquidity > 5000,
+                # DexScreener doesn't provide holder breakdown — leave defaults
+            }
+    except Exception as e:
+        log.warning(f"[DexScreener] Error {mint[:12]}: {e}")
+    return {}
+
+# ─── Formatters ────────────────────────────────────────────────────────────────
 def format_alert(alert) -> str:
-    e            = alert.entry
-    r            = alert.rug
-    t            = alert.token
-    n            = alert.narrative
+    e = alert.entry
+    r = alert.rug
+    t = alert.token
+    n = alert.narrative
     entry_score  = e.get("final_score", 0)
     rug_score    = r.get("rug_score", 10)
     flags        = r.get("flags", [])
@@ -225,16 +279,16 @@ def format_alert(alert) -> str:
         f"<code>{mint}</code>", "",
         f"📊 <b>ENTRY:  {entry_score}/10  {e.get('verdict','')}</b>",
         f"🔒 <b>RUG:    {rug_score}/10  {r.get('verdict','')}</b>", "",
-        f"📡 Narrative:  <b>{narrative_kw}</b>  ({n.get('narrative_score', 0):.1f}/10)",
-        f"💧 Liquidity:  <b>${t.get('liquidity_usd', 0):,.0f}</b>",
-        f"👥 Holders:    <b>{t.get('total_holders', 0)}</b>",
-        f"⏱ Age:        <b>{t.get('age_hours', 0):.1f}h</b>",
-        f"📈 Vol 1h:     <b>${t.get('volume_1h_usd', 0):,.0f}</b>", "",
-        f"NAR {comps.get('narrative', {}).get('score', '?')}  "
-        f"TIM {comps.get('timing', {}).get('score', '?')}  "
-        f"HOL {comps.get('holders', {}).get('score', '?')}  "
-        f"DEP {comps.get('deployer', {}).get('score', '?')}  "
-        f"MOM {comps.get('momentum', {}).get('score', '?')}", "",
+        f"📡 Narrative:  <b>{narrative_kw}</b>  ({n.get('narrative_score',0):.1f}/10)",
+        f"💧 Liquidity:  <b>${t.get('liquidity_usd',0):,.0f}</b>",
+        f"👥 Holders:    <b>{t.get('total_holders',0)}</b>",
+        f"⏱ Age:        <b>{t.get('age_hours',0):.1f}h</b>",
+        f"📈 Vol 1h:     <b>${t.get('volume_1h_usd',0):,.0f}</b>", "",
+        f"NAR {comps.get('narrative',{}).get('score','?')}  "
+        f"TIM {comps.get('timing',{}).get('score','?')}  "
+        f"HOL {comps.get('holders',{}).get('score','?')}  "
+        f"DEP {comps.get('deployer',{}).get('score','?')}  "
+        f"MOM {comps.get('momentum',{}).get('score','?')}", "",
         f"<b>Flags:</b> {flag_str}",
     ]
     if e.get("signals"):
@@ -286,11 +340,11 @@ def format_leaderboard(records: list, period: str) -> str:
     medals = ["🥇", "🥈", "🥉"]
     lines  = [f"📊 <b>{period} LEADERBOARD</b>", f"<i>{len(records)} tokens tracked</i>", ""]
     for i, r in enumerate(sorted_records[:10]):
-        medal      = medals[i] if i < 3 else f"{i+1}."
-        peak_x     = r.get("peak_x", 1)
-        current_x  = r.get("current_x", 1)
-        migrated   = "🎓" if r.get("migrated") else ""
-        narrative  = r.get("narrative", "").upper()
+        medal       = medals[i] if i < 3 else f"{i+1}."
+        peak_x      = r.get("peak_x", 1)
+        current_x   = r.get("current_x", 1)
+        migrated    = "🎓" if r.get("migrated") else ""
+        narrative   = r.get("narrative", "").upper()
         entry_score = r.get("entry_score", 0)
         if peak_x >= 10:   perf = "💎"
         elif peak_x >= 5:  perf = "🌕"
@@ -376,27 +430,40 @@ def format_help() -> str:
         "/help            — this menu",
     ])
 
+# ─── MCap Fetcher (tracker) ────────────────────────────────────────────────────
 @retry_on_429(max_retries=3, base_delay=2.0)
 async def get_current_mcap(mint: str) -> Tuple[float, bool]:
-    if not BIRDEYE_API_KEY:
-        return 0.0, False
+    """Try Birdeye first, fall back to DexScreener for tracked tokens."""
+    if BIRDEYE_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.get(
+                    "https://public-api.birdeye.so/defi/token_overview",
+                    params={"address": mint},
+                    headers={"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana"}
+                )
+                if resp.status_code == 200:
+                    data      = resp.json().get("data") or {}
+                    mcap      = float(data.get("mc") or 0)
+                    liquidity = float(data.get("liquidity") or 0)
+                    migrated  = mcap >= 65000 and liquidity > 10000
+                    if migrated and not await verify_raydium_pool(mint):
+                        migrated = False
+                    if mcap > 0:
+                        return mcap, migrated
+        except Exception as e:
+            log.warning(f"[MCap/Birdeye] {mint[:12]}: {e}")
+
+    # Fallback to DexScreener
     try:
-        async with httpx.AsyncClient(timeout=8) as client:
-            resp = await client.get(
-                "https://public-api.birdeye.so/defi/token_overview",
-                params={"address": mint},
-                headers={"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana"}
-            )
-            resp.raise_for_status()
-            data      = resp.json().get("data") or {}
-            mcap      = float(data.get("mc") or 0)
-            liquidity = float(data.get("liquidity") or 0)
-            migrated  = mcap >= 65000 and liquidity > 10000
-            if migrated and not await verify_raydium_pool(mint):
-                migrated = False
+        dex = await fetch_dexscreener(mint)
+        if dex.get("mcap_usd", 0) > 0:
+            mcap     = dex["mcap_usd"]
+            migrated = mcap >= 65000 and dex.get("liquidity_usd", 0) > 10000
             return mcap, migrated
     except Exception as e:
-        log.warning(f"[MCap] {mint[:12]}: {e}")
+        log.warning(f"[MCap/DexScreener] {mint[:12]}: {e}")
+
     return 0.0, False
 
 async def verify_raydium_pool(mint: str) -> bool:
@@ -411,8 +478,7 @@ async def verify_raydium_pool(mint: str) -> bool:
                       "params": [
                           "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
                           {"filters": [{"memcmp": {"offset": 400, "bytes": mint}}],
-                           "encoding": "base64",
-                           "dataSlice": {"length": 0, "offset": 0}}
+                           "encoding": "base64", "dataSlice": {"length": 0, "offset": 0}}
                       ]}
             )
             if resp.status_code == 200:
@@ -421,13 +487,18 @@ async def verify_raydium_pool(mint: str) -> bool:
         log.debug(f"[Raydium] {mint[:12]}: {e}")
     return False
 
+# ─── Token Enrichment ──────────────────────────────────────────────────────────
 @retry_on_429(max_retries=2, base_delay=1.0)
-async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> dict:
+async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> Tuple[dict, str]:
+    """
+    Returns (token_data, source) where source is 'birdeye', 'dexscreener', or 'none'.
+    Caller must check source != 'none' before scoring.
+    """
     base = {
         "mint": mint, "name": name, "symbol": symbol, "deployer": deployer,
         "age_hours": 0.5, "mcap_usd": 0, "liquidity_usd": 0,
-        "total_holders": 50, "top1_pct": 50.0, "top5_pct": 70.0,
-        "top10_pct": 80.0, "dev_holds_pct": 0.0, "wallet_clusters": 0,
+        "total_holders": 50, "top1_pct": 5.0, "top5_pct": 20.0,
+        "top10_pct": 25.0, "dev_holds_pct": 0.0, "wallet_clusters": 0,
         "holder_growth_1h": 0, "mint_authority_revoked": True,
         "freeze_authority_revoked": True, "lp_burned": False, "lp_locked": False,
         "pool_age_hours": 0.5, "deployer_age_days": 30,
@@ -436,7 +507,30 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> dict
         "price_change_5m_pct": 0, "price_change_1h_pct": 0,
         "buy_sell_ratio_1h": 1.0, "market_conditions": "neutral",
     }
+    source = "none"
 
+    # ── Helius: mint/freeze authority (always try) ──────────────────────────
+    if HELIUS_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.post(
+                    f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
+                    json={"jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
+                          "params": [mint, {"encoding": "jsonParsed"}]}
+                )
+                if resp.status_code == 200:
+                    result = resp.json().get("result") or {}
+                    value  = result.get("value") or {}
+                    info   = ((value.get("data") or {}).get("parsed") or {}).get("info") or {}
+                    if info:
+                        base["mint_authority_revoked"]   = info.get("mintAuthority") is None
+                        base["freeze_authority_revoked"] = info.get("freezeAuthority") is None
+                        supply = float(info.get("supply", 0)) / (10 ** info.get("decimals", 0))
+                        base["total_supply"] = supply
+        except Exception as e:
+            log.warning(f"[Helius] {mint[:12]}: {e}")
+
+    # ── Birdeye: full market data ───────────────────────────────────────────
     if BIRDEYE_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=8) as client:
@@ -448,53 +542,38 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> dict
                 if resp.status_code == 200:
                     data      = resp.json().get("data") or {}
                     liquidity = float(data.get("liquidity") or 0)
-                    v1h       = float(data.get("v1hUSD") or 0)
-                    v5m       = float(data.get("v5mUSD") or 0)
-                    buy1h     = int(data.get("buy1h") or 1)
-                    sell1h    = int(data.get("sell1h") or 1)
-                    holders   = int(data.get("holder") or 50)
                     mc        = float(data.get("mc") or 0)
-                    pc1h      = float(data.get("priceChange1hPercent") or 0)
-                    pc5m      = float(data.get("priceChange5mPercent") or 0)
-                    top1_pct  = float(data.get("top1HolderPercent") or 50)
-                    top10_pct = float(data.get("top10HolderPercent") or 80)
-                    log.info(f"  -> Birdeye: liq=${liquidity:,.0f} mcap=${mc:,.0f} holders={holders}")
-                    base.update({
-                        "liquidity_usd": liquidity, "mcap_usd": mc,
-                        "volume_1h_usd": v1h, "volume_5m_usd": v5m,
-                        "price_change_1h_pct": pc1h, "price_change_5m_pct": pc5m,
-                        "buy_sell_ratio_1h": buy1h / max(sell1h, 1),
-                        "total_holders": holders, "top1_pct": top1_pct,
-                        "top10_pct": top10_pct, "lp_locked": liquidity > 5000,
-                    })
-                # 400 = not indexed yet — silently continue with Helius-only
+                    if mc > 0 or liquidity > 0:
+                        base.update({
+                            "liquidity_usd":       liquidity,
+                            "mcap_usd":            mc,
+                            "volume_1h_usd":       float(data.get("v1hUSD") or 0),
+                            "volume_5m_usd":       float(data.get("v5mUSD") or 0),
+                            "price_change_1h_pct": float(data.get("priceChange1hPercent") or 0),
+                            "price_change_5m_pct": float(data.get("priceChange5mPercent") or 0),
+                            "buy_sell_ratio_1h":   int(data.get("buy1h") or 1) / max(int(data.get("sell1h") or 1), 1),
+                            "total_holders":       int(data.get("holder") or 50),
+                            "top1_pct":            float(data.get("top1HolderPercent") or 5),
+                            "top10_pct":           float(data.get("top10HolderPercent") or 25),
+                            "lp_locked":           liquidity > 5000,
+                        })
+                        log.info(f"  -> Birdeye: liq=${liquidity:,.0f} mcap=${mc:,.0f}")
+                        source = "birdeye"
+                elif resp.status_code == 400:
+                    log.info(f"  -> Birdeye 400 — trying DexScreener...")
         except Exception as e:
-            log.warning(f"[Birdeye] Error: {e}")
+            log.warning(f"[Birdeye] {mint[:12]}: {e}")
 
-    if HELIUS_API_KEY:
-        try:
-            async with httpx.AsyncClient(timeout=8) as client:
-                resp = await client.post(
-                    f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
-                    json={"jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
-                          "params": [mint, {"encoding": "jsonParsed"}]}
-                )
-                if resp.status_code == 200:
-                    info = ((resp.json().get("result") or {})
-                            .get("value", {})
-                            .get("data", {})
-                            .get("parsed", {})
-                            .get("info") or {})
-                    if info:
-                        base["mint_authority_revoked"]   = info.get("mintAuthority") is None
-                        base["freeze_authority_revoked"] = info.get("freezeAuthority") is None
-                        decimals = info.get("decimals", 0)
-                        base["total_supply"] = float(info.get("supply", 0)) / (10 ** decimals)
-        except Exception as e:
-            log.warning(f"[Helius] Error: {e}")
+    # ── DexScreener fallback ────────────────────────────────────────────────
+    if source == "none":
+        dex = await fetch_dexscreener(mint)
+        if dex.get("mcap_usd", 0) > 0 or dex.get("liquidity_usd", 0) > 0:
+            base.update(dex)
+            source = "dexscreener"
 
-    return base
+    return base, source
 
+# ─── Tracker ───────────────────────────────────────────────────────────────────
 async def track_tokens():
     semaphore = asyncio.Semaphore(TRACKER_CONCURRENCY)
 
@@ -509,11 +588,9 @@ async def track_tokens():
                     asyncio.create_task(save_leaderboard_async())
                     log.info(f"[TRACKER] Archived {token.symbol} peak={token.peak_x:.1f}X")
                     return
-
                 current_mcap, migrated_flag = await get_current_mcap(mint)
                 if current_mcap == 0:
                     return
-
                 async with tracked_lock:
                     if mint not in tracked:
                         return
@@ -522,7 +599,6 @@ async def track_tokens():
                     token.peak_mcap    = max(token.peak_mcap, current_mcap)
                     token.peak_x       = token.peak_mcap / max(token.entry_mcap, 1)
                     token.last_updated = utcnow()
-
                     if migrated_flag and not token.migration_verified:
                         if await verify_raydium_pool(mint):
                             token.migrated = token.migration_verified = True
@@ -531,7 +607,6 @@ async def track_tokens():
                             await send_telegram(format_migration_alert(token, current_mcap))
                         else:
                             token.migrated = True
-
                     if token.entry_mcap > 0:
                         multiplier = current_mcap / token.entry_mcap
                         for x in X_MILESTONES:
@@ -540,7 +615,7 @@ async def track_tokens():
                                 log.info(f"[TRACKER] {x}X: {token.symbol}")
                                 await send_telegram(format_x_alert(token, current_mcap, x))
             except Exception as e:
-                log.error(f"[TRACKER] {mint[:12]}: {e}")
+                log.error(f"[TRACKER] Error {mint[:12]}: {e}")
 
     while True:
         await asyncio.sleep(120)
@@ -548,11 +623,11 @@ async def track_tokens():
             tokens_to_check = list(tracked.items())
         if not tokens_to_check:
             continue
-        tasks = [update_single(mint, token) for mint, token in tokens_to_check]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*[update_single(m, t) for m, t in tokens_to_check], return_exceptions=True)
 
+# ─── Leaderboard Scheduler ─────────────────────────────────────────────────────
 async def leaderboard_scheduler():
-    intervals = {"daily": timedelta(days=1), "weekly": timedelta(days=7), "monthly": timedelta(days=30)}
+    intervals = {'daily': timedelta(days=1), 'weekly': timedelta(days=7), 'monthly': timedelta(days=30)}
     last_run  = {k: utcnow() for k in intervals}
     while True:
         await asyncio.sleep(60)
@@ -561,9 +636,8 @@ async def leaderboard_scheduler():
             if (now - last_run[period]).total_seconds() >= delta.total_seconds():
                 last_run[period] = now
                 records = await _get_records_since_async(now - delta)
-                period_name = "24H" if period == "daily" else period.upper()
+                period_name = "24H" if period == 'daily' else period.upper()
                 await send_telegram(format_leaderboard(records, period_name))
-                log.info(f"[LB] Posted {period} ({len(records)} records)")
 
 async def _get_records_since_async(cutoff: datetime) -> List[dict]:
     records = []
@@ -580,49 +654,49 @@ async def _get_records_since_async(cutoff: datetime) -> List[dict]:
                 continue
     return records
 
+# ─── Command Handler ───────────────────────────────────────────────────────────
 async def handle_commands():
     offset = 0
     log.info("[CMD] Command listener started")
 
-    async def _send_leaderboard(chat_id, days):
-        cutoff = utcnow() - timedelta(days=days)
-        label  = "24H" if days == 1 else f"{days}D"
-        await send_telegram(format_leaderboard(await _get_records_since_async(cutoff), label), chat_id)
+    async def _send_leaderboard(chat_id: str, days: int):
+        records = await _get_records_since_async(utcnow() - timedelta(days=days))
+        period_name = "24H" if days == 1 else f"{days}D"
+        await send_telegram(format_leaderboard(records, period_name), chat_id)
 
     commands = {
-        "/status":      lambda cid: send_telegram(format_status(), cid),
-        "/leaderboard": lambda cid: _send_leaderboard(cid, 1),
-        "/weekly":      lambda cid: _send_leaderboard(cid, 7),
-        "/monthly":     lambda cid: _send_leaderboard(cid, 30),
-        "/narratives":  lambda cid: send_telegram(format_narratives(), cid),
-        "/tracking":    lambda cid: send_telegram(format_tracking(), cid),
-        "/help":        lambda cid: send_telegram(format_help(), cid),
+        '/status':      lambda cid: send_telegram(format_status(), cid),
+        '/leaderboard': lambda cid: _send_leaderboard(cid, 1),
+        '/weekly':      lambda cid: _send_leaderboard(cid, 7),
+        '/monthly':     lambda cid: _send_leaderboard(cid, 30),
+        '/narratives':  lambda cid: send_telegram(format_narratives(), cid),
+        '/tracking':    lambda cid: send_telegram(format_tracking(), cid),
+        '/help':        lambda cid: send_telegram(format_help(), cid),
     }
 
     while True:
         try:
             updates = await get_telegram_updates(offset)
             for update in updates:
-                offset = update["update_id"] + 1
+                offset  = update["update_id"] + 1
                 msg     = update.get("message", {})
                 text    = msg.get("text", "").strip()
                 chat_id = str(msg.get("chat", {}).get("id", ""))
-                if not text.startswith("/"):
-                    continue
-                cmd = text.split()[0].lower().split("@")[0]
+                if not text.startswith("/"): continue
+                cmd = text.split()[0].lower().split('@')[0]
                 log.info(f"[CMD] {cmd} from {chat_id}")
                 if cmd in commands:
                     await commands[cmd](chat_id)
                 else:
-                    await send_telegram(f"❓ Unknown command: {cmd}\nTry /help", chat_id)
+                    await send_telegram(f"❓ Unknown: {cmd}\nTry /help", chat_id)
         except Exception as e:
-            log.error(f"[CMD] Error: {e}")
+            log.error(f"[CMD] Loop error: {e}")
             await asyncio.sleep(5)
         await asyncio.sleep(0.1)
 
+# ─── Main Bot Loop ─────────────────────────────────────────────────────────────
 async def run_bot():
     global sniper_ref, total_alerts_fired, bot_start_time
-
     bot_start_time = utcnow()
     load_leaderboard()
 
@@ -637,11 +711,12 @@ async def run_bot():
                 try:
                     sniper.inject_narrative(parts[0], parts[1], float(parts[2]))
                 except ValueError:
-                    log.warning(f"[SEED] Invalid: {parts[0]}")
+                    log.warning(f"[SEED] Invalid score for {parts[0]}")
 
     log.info("=" * 50)
-    log.info("  SOLANA_NARRATIVE_SNIPER — BOT ONLINE [v2.3]")
+    log.info("  SOLANA_NARRATIVE_SNIPER — BOT ONLINE [v2.4]")
     log.info(f"  Threshold: {ALERT_THRESHOLD}  MinLP: ${MIN_LIQUIDITY:,.0f}")
+    log.info(f"  Data: Birdeye -> DexScreener fallback")
     log.info(f"  Holder filters: top1 < 10%  top10 < 40%")
     log.info(f"  WS reconnect max: 30s")
     log.info(f"  Telegram: {'on' if TELEGRAM_BOT_TOKEN else 'off'}")
@@ -653,10 +728,10 @@ async def run_bot():
         await asyncio.sleep(2)
 
     await send_telegram(
-        "🎯 <b>SOLANA_NARRATIVE_SNIPER ONLINE</b> [v2.3]\n"
-        f"Threshold: {ALERT_THRESHOLD}/10  |  top1 &lt;10%  top10 &lt;40%\n"
-        f"Tracking: {X_MILESTONES}x + migrations\n"
-        f"Commands: /status /leaderboard /tracking /help\n"
+        "🎯 <b>SOLANA_NARRATIVE_SNIPER ONLINE</b> [v2.4]\n"
+        f"Threshold: {ALERT_THRESHOLD}/10  |  Min LP: ${MIN_LIQUIDITY:,.0f}\n"
+        f"Data: Birdeye → DexScreener fallback\n"
+        f"Commands: /status /leaderboard /narratives /tracking /help\n"
         f"<i>Watching Pump.fun live...</i>"
     )
 
@@ -666,22 +741,18 @@ async def run_bot():
         asyncio.create_task(leaderboard_scheduler()),
         asyncio.create_task(handle_commands()),
     ]
-
     try:
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
         log.info("[BOT] Shutting down...")
-        for t in tasks:
-            t.cancel()
+        for t in tasks: t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
     except Exception as e:
-        log.critical(f"[BOT] Fatal: {e}")
-        raise
+        log.critical(f"[BOT] Fatal: {e}"); raise
 
 async def _bot_loop(sniper):
     retry_delay = 5
-    max_delay   = 30   # FIX: was 300
-
+    max_delay   = 30
     while True:
         try:
             await asyncio.wait_for(_listen(sniper), timeout=3600)
@@ -692,9 +763,7 @@ async def _bot_loop(sniper):
             log.warning(f"[WS] Closed: {e}")
         except Exception as e:
             log.error(f"[WS] Error: {e}")
-
-        jitter     = random.random() * 2
-        sleep_time = min(retry_delay + jitter, max_delay)
+        sleep_time = min(retry_delay + random.random() * 2, max_delay)
         log.info(f"[WS] Reconnecting in {sleep_time:.1f}s...")
         await asyncio.sleep(sleep_time)
         retry_delay = min(retry_delay * 2, max_delay)
@@ -713,6 +782,7 @@ async def _listen(sniper):
                 pass
             except Exception as e:
                 log.error(f"[WS] Handler error: {e}")
+
 async def handle_token(sniper, msg: dict):
     global total_alerts_fired
 
@@ -725,10 +795,8 @@ async def handle_token(sniper, msg: dict):
     deployer = msg.get("traderPublicKey", "")
     desc     = msg.get("description", "")
 
-    if not mint or not name:
-        return
-    if len(mint) < 32 or len(mint) > 44:
-        return
+    if not mint or not name: return
+    if len(mint) < 32 or len(mint) > 44: return
 
     log.info(f"[NEW] {name} (${symbol}) {mint[:12]}...")
 
@@ -737,38 +805,38 @@ async def handle_token(sniper, msg: dict):
         log.info(f"  -> No narrative match")
         return
 
-    # Wait 30s for token to settle, then enrich
+    # Wait 30s then fetch
     await asyncio.sleep(30)
-    token_data = await enrich_token(mint, name, symbol, deployer)
+    token_data, source = await enrich_token(mint, name, symbol, deployer)
     token_data["description"] = desc
 
-    birdeye_ok = token_data["mcap_usd"] > 0 or token_data["liquidity_usd"] > 0
-
-    # If Birdeye had no data, wait 60s and retry once
-    if not birdeye_ok:
-        log.info(f"  -> No Birdeye data — retrying in 60s...")
+    # If no market data yet, wait 60s and try once more
+    if source == "none":
+        log.info(f"  -> No market data yet — retrying in 60s...")
         await asyncio.sleep(60)
-        token_data = await enrich_token(mint, name, symbol, deployer)
+        token_data, source = await enrich_token(mint, name, symbol, deployer)
         token_data["description"] = desc
-        birdeye_ok = token_data["mcap_usd"] > 0 or token_data["liquidity_usd"] > 0
 
-    if birdeye_ok:
-        log.info(f"  -> Birdeye: liq=${token_data['liquidity_usd']:,.0f} mcap=${token_data['mcap_usd']:,.0f}")
+    # Skip if still no data from either source
+    if source == "none":
+        log.info(f"  -> No data from Birdeye or DexScreener — skip")
+        return
 
-        # Liquidity filter
-        if token_data["liquidity_usd"] < MIN_LIQUIDITY:
-            log.info(f"  -> LP ${token_data['liquidity_usd']:,.0f} below minimum — skip")
-            return
+    log.info(f"  -> Source: {source}  liq=${token_data['liquidity_usd']:,.0f}  mcap=${token_data['mcap_usd']:,.0f}")
 
-        # Holder filters
+    # Liquidity filter
+    if token_data["liquidity_usd"] < MIN_LIQUIDITY:
+        log.info(f"  -> LP ${token_data['liquidity_usd']:,.0f} < ${MIN_LIQUIDITY:,.0f} — skip")
+        return
+
+    # Holder filters (only when source provides real holder data)
+    if source == "birdeye":
         if token_data["top1_pct"] > 10:
             log.info(f"  -> Top1 {token_data['top1_pct']:.1f}% > 10% — skip")
             return
         if token_data["top10_pct"] > 40:
             log.info(f"  -> Top10 {token_data['top10_pct']:.1f}% > 40% — skip")
             return
-    else:
-        log.info(f"  -> Birdeye unavailable after 2 attempts — scoring with Helius data only")
 
     alert       = sniper.analyze_token(token_data)
     entry_score = alert.entry.get("final_score", 0)
@@ -778,7 +846,7 @@ async def handle_token(sniper, msg: dict):
     if entry_score >= ALERT_THRESHOLD:
         async with alerts_lock:
             total_alerts_fired += 1
-        log.info(f"  🎯 FIRING — {name} (${symbol})")
+        log.info(f"  🎯 FIRING — {name} (${symbol})  [{source}]")
         await send_telegram(format_alert(alert))
         entry_mcap = token_data.get("mcap_usd", 0)
         if entry_mcap > 0:
@@ -795,7 +863,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(run_bot())
     except KeyboardInterrupt:
-        log.info("[MAIN] Stopped")
+        log.info("[MAIN] Interrupted")
     except Exception as e:
-        log.critical(f"[MAIN] Fatal: {e}")
-        raise
+        log.critical(f"[MAIN] Fatal: {e}"); raise
