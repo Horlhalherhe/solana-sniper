@@ -21,6 +21,7 @@ class EntryInput:
     launch_age_hours: float = 0.0
     market_conditions: str = "neutral"
     total_holders: int = 0
+    top1_pct: float = 5.0
     top10_pct: float = 50.0
     dev_holds_pct: float = 5.0
     wallet_clusters: int = 0
