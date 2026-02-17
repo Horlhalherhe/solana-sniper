@@ -11,23 +11,37 @@ from collections import defaultdict
 
 NARRATIVE_CATEGORIES = {
     "ai_tech": [
-        "gpt", "claude", "gemini", "llm", "agi", "sora", "devin", "operator",
+        "gpt", "claude", "clawd", "gemini", "llm", "agi", "sora", "devin", "operator",
         "ai agent", "autonomous", "reasoning model", "o3", "o4", "openai", "anthropic",
         "deepseek", "qwen", "mistral", "groq", "inference", "multimodal", "ai", "agent",
-        "aixbt", "labs", "router"
+        "aixbt", "labs", "router", "bytedance", "perplexity", "grok"
     ],
     "animals": [
         "dog", "cat", "frog", "pepe", "bird", "hamster", "penguin", "bear", "wolf",
         "shiba", "doge", "seal", "capybara", "raccoon", "owl", "fox", "goat", "duck",
-        "inu", "monkey", "panda", "hippo", "luna"
+        "inu", "monkey", "panda", "hippo", "luna", "dragon", "tiger", "rabbit", "snake"
     ],
     "culture_meme": [
         "gigachad", "wojak", "npc", "sigma", "based", "irl", "brainrot", "skibidi",
-        "rizz", "goat", "giga", "chad", "ratio", "lowkey", "delulu", "slay"
+        "rizz", "goat", "giga", "chad", "ratio", "lowkey", "delulu", "slay",
+        # nostalgia/throwback memes
+        "harambe", "shrek", "ugandan", "dat boi", "nyan", "grumpy", "leeroy",
+        "rickroll", "gangnam", "harlem", "planking", "mlg", "doritos", "fedora",
+        "hotdog", "numa"
     ],
     "politics_geo": [
-        "trump", "maga", "doge", "elon", "grok", "spacex", "tesla", "musk",
-        "whitehouse", "executive", "tariff", "election", "vote", "political", "wlfi"
+        "trump", "maga", "elon", "spacex", "tesla", "musk",
+        "whitehouse", "executive", "tariff", "election", "vote", "political", "wlfi",
+        # Chinese narrative
+        "china", "chinese", "xi", "ccp", "taiwan", "beijing", "shanghai",
+        "yuan", "baidu", "alibaba", "tencent", "wechat", "tiktok", "hong kong"
+    ],
+    "sports": [
+        "nba", "nfl", "fifa", "soccer", "football", "basketball",
+        "messi", "ronaldo", "lebron", "curry", "kobe",
+        "superbowl", "worldcup", "champions", "championship",
+        "ufc", "mma", "boxing", "f1", "ferrari", "hamilton",
+        "rugby", "cricket", "tennis", "golf", "olympic"
     ],
     "gaming_virtual": [
         "minecraft", "roblox", "fortnite", "gta", "pokemon", "zelda", "anime",
