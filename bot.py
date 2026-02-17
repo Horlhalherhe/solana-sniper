@@ -280,6 +280,7 @@ def format_alert(alert) -> str:
         f"📊 <b>ENTRY:  {entry_score}/10  {e.get('verdict','')}</b>",
         f"🔒 <b>RUG:    {rug_score}/10  {r.get('verdict','')}</b>", "",
         f"📡 Narrative:  <b>{narrative_kw}</b>  ({n.get('narrative_score',0):.1f}/10)",
+        f"💰 MCap:       <b>${t.get('mcap_usd',0):,.0f}</b>",
         f"💧 Liquidity:  <b>${t.get('liquidity_usd',0):,.0f}</b>",
         f"👥 Holders:    <b>{t.get('total_holders',0)}</b>",
         f"⏱ Age:        <b>{t.get('age_hours',0):.1f}h</b>",
@@ -714,7 +715,7 @@ async def run_bot():
                     log.warning(f"[SEED] Invalid score for {parts[0]}")
 
     log.info("=" * 50)
-    log.info("  SOLANA_NARRATIVE_SNIPER — BOT ONLINE [v2.4]")
+    log.info("  TekkiSniPer — BOT ONLINE [v2.4]")
     log.info(f"  Threshold: {ALERT_THRESHOLD}  MinLP: ${MIN_LIQUIDITY:,.0f}")
     log.info(f"  Data: Birdeye -> DexScreener fallback")
     log.info(f"  Holder filters: top1 < 10%  top10 < 40%")
@@ -728,7 +729,7 @@ async def run_bot():
         await asyncio.sleep(2)
 
     await send_telegram(
-        "🎯 <b>SOLANA_NARRATIVE_SNIPER ONLINE</b> [v2.4]\n"
+        "🎯 <b>TekkiSniPer ONLINE</b> [v2.4]\n"
         f"Threshold: {ALERT_THRESHOLD}/10  |  Min LP: ${MIN_LIQUIDITY:,.0f}\n"
         f"Data: Birdeye → DexScreener fallback\n"
         f"Commands: /status /leaderboard /narratives /tracking /help\n"
