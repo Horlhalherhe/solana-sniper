@@ -283,6 +283,7 @@ def format_alert(alert) -> str:
         f"💰 MCap:       <b>${t.get('mcap_usd',0):,.0f}</b>",
         f"💧 Liquidity:  <b>${t.get('liquidity_usd',0):,.0f}</b>",
         f"👥 Holders:    <b>{t.get('total_holders',0)}</b>",
+        f"👨‍💻 Dev holds:  <b>{t.get('dev_holds_pct',0):.1f}%</b>",
         f"⏱ Age:        <b>{t.get('age_hours',0):.1f}h</b>",
         f"📈 Vol 1h:     <b>${t.get('volume_1h_usd',0):,.0f}</b>", "",
         f"NAR {comps.get('narrative',{}).get('score','?')}  "
@@ -510,7 +511,7 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> Tupl
     }
     source = "none"
 
-    # ── Helius: mint/freeze authority (always try) ──────────────────────────
+    # ── Helius: mint/freeze authority + deployer holdings ──────────────────────────
     if HELIUS_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=8) as client:
@@ -528,6 +529,20 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> Tupl
                         base["freeze_authority_revoked"] = info.get("freezeAuthority") is None
                         supply = float(info.get("supply", 0)) / (10 ** info.get("decimals", 0))
                         base["total_supply"] = supply
+                        
+                        # Get deployer's token balance
+                        if supply > 0 and deployer:
+                            balance_resp = await client.post(
+                                f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
+                                json={"jsonrpc": "2.0", "id": 2, "method": "getTokenAccountsByOwner",
+                                      "params": [deployer, {"mint": mint}, {"encoding": "jsonParsed"}]}
+                            )
+                            if balance_resp.status_code == 200:
+                                accounts = balance_resp.json().get("result", {}).get("value", [])
+                                if accounts:
+                                    token_amount = accounts[0].get("account", {}).get("data", {}).get("parsed", {}).get("info", {}).get("tokenAmount", {})
+                                    deployer_balance = float(token_amount.get("uiAmount", 0))
+                                    base["dev_holds_pct"] = (deployer_balance / supply) * 100 if supply > 0 else 0
         except Exception as e:
             log.warning(f"[Helius] {mint[:12]}: {e}")
 
@@ -838,6 +853,11 @@ async def handle_token(sniper, msg: dict):
         if token_data["top10_pct"] > 40:
             log.info(f"  -> Top10 {token_data['top10_pct']:.1f}% > 40% — skip")
             return
+    
+    # Dev holds filter (applies to all sources)
+    if token_data.get("dev_holds_pct", 0) > 5.0:
+        log.info(f"  -> Dev holds {token_data['dev_holds_pct']:.1f}% > 5% — skip")
+        return
 
     alert       = sniper.analyze_token(token_data)
     entry_score = alert.entry.get("final_score", 0)
