@@ -37,6 +37,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("sniper-bot")
 
+# Hide httpx request logs that expose Telegram bot token in URLs
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 # ─── Configuration ─────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -700,7 +704,7 @@ async def handle_commands():
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 if not text.startswith("/"): continue
                 cmd = text.split()[0].lower().split('@')[0]
-                log.info(f"[CMD] {cmd} from {chat_id}")
+                log.info(f"[CMD] {cmd} from user")
                 if cmd in commands:
                     await commands[cmd](chat_id)
                 else:
