@@ -158,6 +158,10 @@ class NarrativeEngine:
 
     def match_token_to_narrative(self, name: str, symbol: str, description: str = "") -> dict:
         combined = f"{name} {symbol} {description}".lower()
+        
+        # Debug: print what we're searching in
+        print(f"[NARRATIVE] Checking: '{combined[:100]}'")
+        
         best_match = None
         best_score = 0.0
         best_confidence = 0.0
@@ -170,8 +174,12 @@ class NarrativeEngine:
                     best_score = weighted
                     best_match = narrative
                     best_confidence = confidence
+                    print(f"[NARRATIVE] ✓ Matched '{kw}' (score={narrative.final_score})")
         
         if not best_match:
+            # Show first few keywords to help debug
+            sample_kw = list(self.active_narratives.keys())[:5]
+            print(f"[NARRATIVE] ✗ No match (checked {len(self.active_narratives)} keywords, e.g. {sample_kw})")
             return {"matched": False, "narrative": None, "confidence": 0.0, "narrative_score": 0.0}
         
         return {
