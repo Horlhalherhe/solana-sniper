@@ -830,8 +830,8 @@ async def handle_token(sniper, msg: dict):
         log.info(f"  -> No narrative match")
         return
 
-    # Wait 30s then fetch
-    await asyncio.sleep(30)
+    # Wait 90s then fetch (gives pools time to form and Birdeye time to index)
+    await asyncio.sleep(90)
     token_data, source = await enrich_token(mint, name, symbol, deployer)
     token_data["description"] = desc
 
