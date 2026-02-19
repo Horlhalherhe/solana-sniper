@@ -547,6 +547,11 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> Tupl
                                     token_amount = accounts[0].get("account", {}).get("data", {}).get("parsed", {}).get("info", {}).get("tokenAmount", {})
                                     deployer_balance = float(token_amount.get("uiAmount", 0))
                                     base["dev_holds_pct"] = (deployer_balance / supply) * 100 if supply > 0 else 0
+                                    log.info(f"  -> Dev wallet: {deployer_balance:,.0f} / {supply:,.0f} ({base['dev_holds_pct']:.1f}%)")
+                                else:
+                                    log.info(f"  -> Dev wallet: no token accounts found")
+                            else:
+                                log.warning(f"  -> Dev balance check failed: {balance_resp.status_code}")
         except Exception as e:
             log.warning(f"[Helius] {mint[:12]}: {e}")
 
@@ -590,6 +595,13 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> Tupl
         if dex.get("mcap_usd", 0) > 0 or dex.get("liquidity_usd", 0) > 0:
             base.update(dex)
             source = "dexscreener"
+    
+    # ── Dev holds fallback: use top1_pct for fresh tokens ──────────────────
+    # If Helius didn't find dev tokens but Birdeye shows a top holder on a fresh token,
+    # assume top holder IS the dev (common for pump.fun tokens <1h old)
+    if base.get("dev_holds_pct", 0) == 0 and base.get("top1_pct", 0) > 0 and base.get("age_hours", 0) < 1:
+        base["dev_holds_pct"] = base["top1_pct"]
+        log.info(f"  -> Dev holds estimated from top1: {base['dev_holds_pct']:.1f}%")
 
     return base, source
 
