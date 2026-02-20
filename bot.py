@@ -906,7 +906,7 @@ async def run_bot():
     bot_start_time = utcnow()
     load_leaderboard()
 # Initialize trading if enabled
-    global trading_engine, trader, position_manager, trading_config
+    global trading_engine, trader, position_manager, trading_config, TRADING_ENABLED
     
     if TRADING_ENABLED and SOLANA_PRIVATE_KEY:
         try:
