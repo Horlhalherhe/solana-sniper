@@ -795,6 +795,7 @@ async def handle_trading_command(chat_id: str, args: str):
 async def send_trading_status(chat_id: str):
     """Send trading status"""
     status = trading_engine.get_status_summary()
+    config = trading_config  # Access the global config
     
     mode = "📝 PAPER" if status["paper_mode"] else "💰 LIVE"
     auto = "✅ ON" if status["auto_buy"] else "⏸ PAUSED"
@@ -804,6 +805,13 @@ async def send_trading_status(chat_id: str):
     msg += f"Positions: {status['active_positions']}/{status['max_positions']}\n"
     msg += f"Deployed: {status['total_deployed_sol']:.3f} SOL\n"
     msg += f"Buy amount: {status['buy_amount_sol']} SOL\n\n"
+    
+    msg += f"<b>Strategy</b>\n"
+    msg += f"Take Profit: {config.tp1_x}X (sell {config.tp1_sell_pct}%)\n"
+    msg += f"Stop Loss: -{config.stop_loss_pct}%\n"
+    msg += f"Trailing Stop: {'ON' if config.trailing_stop_enabled else 'OFF'}\n"
+    msg += f"Max Hold: {config.max_hold_time_hours}h\n\n"
+    
     msg += f"<b>PnL</b>\n"
     msg += f"Total: {status['total_pnl_sol']:+.4f} SOL\n"
     msg += f"Today: {status['daily_pnl_sol']:+.4f} SOL\n\n"
