@@ -48,6 +48,7 @@ HELIUS_API_KEY     = os.getenv("HELIUS_API_KEY", "")
 BIRDEYE_API_KEY    = os.getenv("BIRDEYE_API_KEY", "")
 ALERT_THRESHOLD    = float(os.getenv("ALERT_THRESHOLD", "5.0"))
 MIN_LIQUIDITY      = float(os.getenv("MIN_LIQUIDITY_USD", "5000"))
+MAX_ENTRY_MCAP     = float(os.getenv("MAX_ENTRY_MCAP", "100000"))
 PUMP_WS_URL        = "wss://pumpportal.fun/api/data"
 X_MILESTONES       = [2, 5, 10, 25, 50, 100]
 MAX_LEADERBOARD_HISTORY = 10000
@@ -740,7 +741,7 @@ async def run_bot():
 
     log.info("=" * 50)
     log.info("  TekkiSniPer — BOT ONLINE [v2.4]")
-    log.info(f"  Threshold: {ALERT_THRESHOLD}  MinLP: ${MIN_LIQUIDITY:,.0f}")
+    log.info(f"  Threshold: {ALERT_THRESHOLD}  MinLP: ${MIN_LIQUIDITY:,.0f}  MaxMCap: ${MAX_ENTRY_MCAP:,.0f}")
     log.info(f"  Data: Birdeye -> DexScreener fallback")
     log.info(f"  Holder filters: top1 < 10%  top10 < 40%")
     log.info(f"  WS reconnect max: 30s")
@@ -754,7 +755,7 @@ async def run_bot():
 
     await send_telegram(
         "🎯 <b>TekkiSniPer ONLINE</b> [v2.4]\n"
-        f"Threshold: {ALERT_THRESHOLD}/10  |  Min LP: ${MIN_LIQUIDITY:,.0f}\n"
+        f"Threshold: {ALERT_THRESHOLD}/10  |  Min LP: ${MIN_LIQUIDITY:,.0f}  |  Max MCap: ${MAX_ENTRY_MCAP:,.0f}\n"
         f"Data: Birdeye → DexScreener fallback\n"
         f"Commands: /status /leaderboard /narratives /tracking /help\n"
         f"<i>Watching Pump.fun live...</i>"
@@ -852,6 +853,11 @@ async def handle_token(sniper, msg: dict):
     # Liquidity filter
     if token_data["liquidity_usd"] < MIN_LIQUIDITY:
         log.info(f"  -> LP ${token_data['liquidity_usd']:,.0f} < ${MIN_LIQUIDITY:,.0f} — skip")
+        return
+    
+    # MCap filter (prefer micro caps with more upside)
+    if token_data.get("mcap_usd", 0) > MAX_ENTRY_MCAP:
+        log.info(f"  -> MCap ${token_data['mcap_usd']:,.0f} > ${MAX_ENTRY_MCAP:,.0f} — skip")
         return
 
     # Holder filters (only when source provides real holder data)
