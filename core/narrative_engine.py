@@ -30,7 +30,6 @@ NARRATIVE_CATEGORIES = {
         "hotdog", "numa"
     ],
     "politics_geo": [
-        "trump", "maga", "elon", "spacex", "tesla", "musk",
         "whitehouse", "executive", "tariff", "election", "vote", "political", "wlfi",
         # Chinese narrative
         "china", "chinese", "xi", "ccp", "taiwan", "beijing", "shanghai",
