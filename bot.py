@@ -43,12 +43,15 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # ─── Configuration ─────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")  # Supports comma-separated IDs
 HELIUS_API_KEY     = os.getenv("HELIUS_API_KEY", "")
 BIRDEYE_API_KEY    = os.getenv("BIRDEYE_API_KEY", "")
 ALERT_THRESHOLD    = float(os.getenv("ALERT_THRESHOLD", "5.0"))
 MIN_LIQUIDITY      = float(os.getenv("MIN_LIQUIDITY_USD", "5000"))
 MAX_ENTRY_MCAP     = float(os.getenv("MAX_ENTRY_MCAP", "100000"))
+
+# Parse chat IDs (supports single or comma-separated)
+CHAT_IDS = [cid.strip() for cid in TELEGRAM_CHAT_ID.split(",") if cid.strip()] if TELEGRAM_CHAT_ID else []
 PUMP_WS_URL        = "wss://pumpportal.fun/api/data"
 X_MILESTONES       = [2, 5, 10, 25, 50, 100]
 MAX_LEADERBOARD_HISTORY = 10000
@@ -168,22 +171,43 @@ def retry_on_429(max_retries=3, base_delay=1.0):
 # ─── Telegram ──────────────────────────────────────────────────────────────────
 @retry_on_429(max_retries=3, base_delay=1.0)
 async def send_telegram(text: str, chat_id: str = None) -> int:
+    """Send message to Telegram. If chat_id is None, broadcasts to all configured channels."""
     if not TELEGRAM_BOT_TOKEN:
         print(text); return 0
-    cid = chat_id or TELEGRAM_CHAT_ID
-    if not cid: return 0
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": cid, "text": text, "parse_mode": "HTML",
-                      "disable_web_page_preview": True}
-            )
-            resp.raise_for_status()
-            return resp.json().get("result", {}).get("message_id", 0)
-    except Exception as e:
-        log.error(f"[TG] Send failed: {e}")
-    return 0
+    
+    # If specific chat_id provided (e.g. for command responses), send only to that one
+    if chat_id:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
+                          "disable_web_page_preview": True}
+                )
+                resp.raise_for_status()
+                return resp.json().get("result", {}).get("message_id", 0)
+        except Exception as e:
+            log.error(f"[TG] Send failed to {chat_id}: {e}")
+        return 0
+    
+    # Broadcast mode: send to all configured channels
+    if not CHAT_IDS:
+        return 0
+    
+    last_msg_id = 0
+    for cid in CHAT_IDS:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": cid, "text": text, "parse_mode": "HTML",
+                          "disable_web_page_preview": True}
+                )
+                resp.raise_for_status()
+                last_msg_id = resp.json().get("result", {}).get("message_id", 0)
+        except Exception as e:
+            log.error(f"[TG] Send failed to {cid}: {e}")
+    return last_msg_id
 
 async def delete_telegram_webhook():
     if not TELEGRAM_BOT_TOKEN: return False
@@ -745,7 +769,7 @@ async def run_bot():
     log.info(f"  Data: Birdeye -> DexScreener fallback")
     log.info(f"  Holder filters: top1 < 10%  top10 < 40%")
     log.info(f"  WS reconnect max: 30s")
-    log.info(f"  Telegram: {'on' if TELEGRAM_BOT_TOKEN else 'off'}")
+    log.info(f"  Telegram: {'on' if TELEGRAM_BOT_TOKEN else 'off'} ({len(CHAT_IDS)} channel{'s' if len(CHAT_IDS) != 1 else ''})")
     log.info(f"  Helius: {'on' if HELIUS_API_KEY else 'off'}  Birdeye: {'on' if BIRDEYE_API_KEY else 'off'}")
     log.info("=" * 50)
 
