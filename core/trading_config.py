@@ -94,6 +94,8 @@ class TradingConfig:
         # Risk management
         if os.getenv("STOP_LOSS_PCT"):
             config.stop_loss_pct = float(os.getenv("STOP_LOSS_PCT"))
+        if os.getenv("TRAILING_STOP_ENABLED"):
+            config.trailing_stop_enabled = os.getenv("TRAILING_STOP_ENABLED").lower() == "true"
         if os.getenv("TRAILING_STOP_PCT"):
             config.trailing_stop_pct = float(os.getenv("TRAILING_STOP_PCT"))
         if os.getenv("MAX_HOLD_TIME_HOURS"):
