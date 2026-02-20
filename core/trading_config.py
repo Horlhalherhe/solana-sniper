@@ -76,8 +76,28 @@ class TradingConfig:
             config.buy_amount_sol = float(os.getenv("BUY_AMOUNT_SOL"))
         if os.getenv("MAX_CONCURRENT_POSITIONS"):
             config.max_concurrent_positions = int(os.getenv("MAX_CONCURRENT_POSITIONS"))
+        
+        # Take profit levels
+        if os.getenv("TP1_X"):
+            config.tp1_x = float(os.getenv("TP1_X"))
+        if os.getenv("TP1_SELL_PCT"):
+            config.tp1_sell_pct = float(os.getenv("TP1_SELL_PCT"))
+        if os.getenv("TP2_X"):
+            config.tp2_x = float(os.getenv("TP2_X"))
+        if os.getenv("TP2_SELL_PCT"):
+            config.tp2_sell_pct = float(os.getenv("TP2_SELL_PCT"))
+        if os.getenv("TP3_X"):
+            config.tp3_x = float(os.getenv("TP3_X"))
+        if os.getenv("TP3_SELL_PCT"):
+            config.tp3_sell_pct = float(os.getenv("TP3_SELL_PCT"))
+        
+        # Risk management
         if os.getenv("STOP_LOSS_PCT"):
             config.stop_loss_pct = float(os.getenv("STOP_LOSS_PCT"))
+        if os.getenv("TRAILING_STOP_PCT"):
+            config.trailing_stop_pct = float(os.getenv("TRAILING_STOP_PCT"))
+        if os.getenv("MAX_HOLD_TIME_HOURS"):
+            config.max_hold_time_hours = float(os.getenv("MAX_HOLD_TIME_HOURS"))
         
         config.save()
         return config
