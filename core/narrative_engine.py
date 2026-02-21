@@ -21,7 +21,7 @@ NARRATIVE_CATEGORIES = {
     "animals": [
         "dog", "cat", "frog", "pepe", "bird", "hamster", "penguin", "bear", "wolf",
         "shiba", "doge", "seal", "capybara", "raccoon", "owl", "fox", "goat", "duck",
-        "inu", "monkey", "panda", "hippo", "luna", "dragon", "tiger", "rabbit", "snake",
+        "monkey", "panda", "hippo", "luna", "dragon", "tiger", "rabbit", "snake",
         # 2026 additions
         "corgi", "shib", "lobstar", "openclaw", "molty", "claw", "lobster"
     ],
