@@ -234,7 +234,8 @@ async def send_telegram(text: str, chat_id: str = None) -> int:
     return last_msg_id
 
 async def delete_telegram_webhook():
-    if not TELEGRAM_BOT_TOKEN: return False
+    if not TELEGRAM_BOT_TOKEN: 
+        return False
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
@@ -249,7 +250,9 @@ async def delete_telegram_webhook():
     return False
 
 async def get_telegram_updates(offset: int = 0) -> list:
-    if not TELEGRAM_BOT_TOKEN: return []
+    """Fetch updates from Telegram with proper 409 handling"""
+    if not TELEGRAM_BOT_TOKEN: 
+        return []
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(
@@ -259,9 +262,16 @@ async def get_telegram_updates(offset: int = 0) -> list:
             if resp.status_code == 200:
                 return resp.json().get("result", [])
             elif resp.status_code == 409:
-                log.warning("[TG] 409 Conflict")
-                await asyncio.sleep(5)
+                # Raise exception to trigger backoff in handle_commands
+                raise Exception(f"409 Conflict: {resp.text}")
+            else:
+                log.warning(f"[TG] HTTP {resp.status_code}: {resp.text[:100]}")
+    except httpx.TimeoutException:
+        log.debug("[TG] Long-polling timeout (normal)")
     except Exception as e:
+        # Re-raise 409s and other errors for handle_commands to handle
+        if "409" in str(e) or "conflict" in str(e).lower():
+            raise
         log.debug(f"[TG] Updates error: {e}")
     return []
 
@@ -874,7 +884,10 @@ async def send_pnl_summary(chat_id: str):
 
 # ─── Command Handler ───────────────────────────────────────────────────────────
 async def handle_commands():
+    """Handle Telegram commands with 409 Conflict recovery"""
     offset = 0
+    consecutive_409s = 0
+    max_409_delay = 300  # Max 5 minutes backoff
     log.info("[CMD] Command listener started")
 
     async def _send_leaderboard(chat_id: str, days: int):
@@ -895,21 +908,26 @@ async def handle_commands():
     while True:
         try:
             updates = await get_telegram_updates(offset)
+            
+            # Reset 409 counter on success
+            if consecutive_409s > 0:
+                log.info(f"[CMD] Recovered from 409 after {consecutive_409s} attempts")
+                consecutive_409s = 0
+            
             for update in updates:
                 offset  = update["update_id"] + 1
                 msg     = update.get("message", {})
                 text    = msg.get("text", "").strip()
                 chat_id = str(msg.get("chat", {}).get("id", ""))
-                if not text.startswith("/"): continue
+                if not text.startswith("/"): 
+                    continue
                 
-                # Parse command and args
                 parts = text.split(maxsplit=1)
                 cmd = parts[0].lower().split('@')[0]
                 args = parts[1] if len(parts) > 1 else ""
                 
                 log.info(f"[CMD] {cmd} from user")
                 
-                # Handle /trading specially (has subcommands)
                 if cmd == "/trading":
                     await handle_trading_command(chat_id, args)
                     continue
@@ -918,9 +936,27 @@ async def handle_commands():
                     await commands[cmd](chat_id)
                 else:
                     await send_telegram(f"❓ Unknown: {cmd}\nTry /help", chat_id)
+                    
         except Exception as e:
-            log.error(f"[CMD] Loop error: {e}")
-            await asyncio.sleep(5)
+            error_str = str(e).lower()
+            
+            # Handle 409 Conflict specifically
+            if "409" in error_str or "conflict" in error_str:
+                consecutive_409s += 1
+                # Exponential backoff: 5s, 10s, 20s, 40s... up to 5 min
+                delay = min(5 * (2 ** (consecutive_409s - 1)), max_409_delay)
+                log.warning(f"[CMD] 409 Conflict #{consecutive_409s}, backing off {delay}s")
+                
+                # Force webhook delete on repeated 409s
+                if consecutive_409s % 3 == 0:
+                    log.info("[CMD] Attempting webhook reset...")
+                    await delete_telegram_webhook()
+                
+                await asyncio.sleep(delay)
+            else:
+                log.error(f"[CMD] Loop error: {e}")
+                await asyncio.sleep(5)
+                
         await asyncio.sleep(0.1)
 
 # ─── Main Bot Loop ─────────────────────────────────────────────────────────────
@@ -972,8 +1008,15 @@ async def run_bot():
     log.info("=" * 50)
 
     if TELEGRAM_BOT_TOKEN:
-        await delete_telegram_webhook()
-        await asyncio.sleep(2)
+        # Aggressive cleanup for Railway cold starts
+        log.info("[TG] Cleaning up previous sessions...")
+        for i in range(3):
+            await delete_telegram_webhook()
+            await asyncio.sleep(3)  # Wait longer between attempts
+        
+        # Wait for Telegram to propagate the deletion
+        log.info("[TG] Waiting for session cleanup (Railway cold start)...")
+        await asyncio.sleep(10)  # Critical: gives Telegram time to clear old polling
 
     await send_telegram(
         "🎯 <b>TekkiSniPer ONLINE</b> [v2.4]\n"
@@ -998,10 +1041,12 @@ async def run_bot():
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
         log.info("[BOT] Shutting down...")
-        for t in tasks: t.cancel()
+        for t in tasks: 
+            t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
     except Exception as e:
-        log.critical(f"[BOT] Fatal: {e}"); raise
+        log.critical(f"[BOT] Fatal: {e}")
+        raise
 
 async def _bot_loop(sniper):
     retry_delay = 5
@@ -1048,8 +1093,10 @@ async def handle_token(sniper, msg: dict):
     deployer = msg.get("traderPublicKey", "")
     desc     = msg.get("description", "")
 
-    if not mint or not name: return
-    if len(mint) < 32 or len(mint) > 44: return
+    if not mint or not name: 
+        return
+    if len(mint) < 32 or len(mint) > 44: 
+        return
 
     log.info(f"[NEW] {name} (${symbol}) {mint[:12]}...")
 
@@ -1149,4 +1196,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         log.info("[MAIN] Interrupted")
     except Exception as e:
-        log.critical(f"[MAIN] Fatal: {e}"); raise
+        log.critical(f"[MAIN] Fatal: {e}")
+        raise
