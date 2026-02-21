@@ -11,8 +11,6 @@ FIXES v2.4:
 - Tokens skipped cleanly if both Birdeye AND DexScreener unavailable
 - WS reconnect max 30s
 - No crashes on Helius-only data
-- WEBHOOK MODE: Eliminates 409 Conflicts on Railway
-- SINGLETON LOCK: Prevents multiple instances
 """
 
 import asyncio
@@ -22,15 +20,12 @@ import sys
 import logging
 import functools
 import random
-import socket
-import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 
 import httpx
 import websockets
-from flask import Flask, request
 
 sys.path.insert(0, str(Path(__file__).parent))
 from sniper import SolanaNarrativeSniper
@@ -45,24 +40,6 @@ try:
 except ImportError as e:
     TRADING_AVAILABLE = False
 
-# ─── RAILWAY SINGLETON LOCK ────────────────────────────────────────────────────
-def acquire_singleton_lock():
-    """Ensure only one instance runs on Railway"""
-    try:
-        # Unix socket abstract namespace lock
-        lock_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        lock_socket.bind('\0tekki_sniper_lock')
-        print("[RAILWAY] Singleton lock acquired")
-        return lock_socket
-    except socket.error:
-        print("ERROR: Another instance already running! Exiting.")
-        os._exit(1)
-
-# Enforce singleton on Railway
-if os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_PUBLIC_DOMAIN"):
-    _lock_socket = acquire_singleton_lock()
-
-# ─── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -73,26 +50,25 @@ log = logging.getLogger("sniper-bot")
 # Hide httpx request logs that expose Telegram bot token in URLs
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
-logging.getLogger("werkzeug").setLevel(logging.WARNING)  # Hide Flask logs
 
 # ─── Configuration ─────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")  # Supports comma-separated IDs
 HELIUS_API_KEY     = os.getenv("HELIUS_API_KEY", "")
 BIRDEYE_API_KEY    = os.getenv("BIRDEYE_API_KEY", "")
 ALERT_THRESHOLD    = float(os.getenv("ALERT_THRESHOLD", "5.0"))
 MIN_LIQUIDITY      = float(os.getenv("MIN_LIQUIDITY_USD", "5000"))
 MAX_ENTRY_MCAP     = float(os.getenv("MAX_ENTRY_MCAP", "100000"))
-RAILWAY_DOMAIN     = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
 
 # Trading configuration
 SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY", "")
 TRADING_ENABLED = TRADING_AVAILABLE and bool(SOLANA_PRIVATE_KEY)
 
-# Blacklist
+# Blacklist - reject tokens with these keywords even if they match narratives
 BLACKLIST_KEYWORDS_STR = os.getenv("BLACKLIST_KEYWORDS", "inu,wif,wif hat,with hat")
 BLACKLIST_KEYWORDS = [k.strip().lower() for k in BLACKLIST_KEYWORDS_STR.split(",") if k.strip()]
 
+# Parse chat IDs (supports single or comma-separated)
 CHAT_IDS = [cid.strip() for cid in TELEGRAM_CHAT_ID.split(",") if cid.strip()] if TELEGRAM_CHAT_ID else []
 PUMP_WS_URL        = "wss://pumpportal.fun/api/data"
 X_MILESTONES       = [2, 5, 10, 25, 50, 100]
@@ -110,31 +86,6 @@ alerts_lock  = asyncio.Lock()
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
-
-# ─── Flask App for Webhook & Health ────────────────────────────────────────────
-flask_app = Flask(__name__)
-
-@flask_app.route("/health")
-def health_check():
-    """Railway health check endpoint"""
-    return {
-        "status": "ok",
-        "uptime": str(utcnow() - bot_start_time) if bot_start_time else "starting",
-        "tracked": len(tracked),
-        "alerts": total_alerts_fired
-    }, 200
-
-@flask_app.route(f"/webhook/{TELEGRAM_BOT_TOKEN}", methods=['POST'])
-def telegram_webhook():
-    """Handle Telegram updates via webhook"""
-    try:
-        update = request.get_json()
-        # Process async in background
-        asyncio.create_task(process_update(update))
-        return "OK", 200
-    except Exception as e:
-        log.error(f"[WEBHOOK] Error: {e}")
-        return "Error", 500
 
 # ─── Tracked Token ─────────────────────────────────────────────────────────────
 class TrackedToken:
@@ -176,8 +127,10 @@ class TrackedToken:
 tracked: Dict[str, TrackedToken] = {}
 leaderboard_history: List[dict] = []
 sniper_ref: Optional[SolanaNarrativeSniper] = None
-bot_start_time: Optional[datetime] = None
+bot_start_time: datetime = utcnow()
 total_alerts_fired: int = 0
+
+# Trading globals  
 trading_engine: Optional['TradingEngine'] = None
 trader: Optional['SolanaTrader'] = None
 position_manager: Optional['PositionManager'] = None
@@ -242,10 +195,11 @@ def retry_on_429(max_retries=3, base_delay=1.0):
 # ─── Telegram ──────────────────────────────────────────────────────────────────
 @retry_on_429(max_retries=3, base_delay=1.0)
 async def send_telegram(text: str, chat_id: str = None) -> int:
+    """Send message to Telegram. If chat_id is None, broadcasts to all configured channels."""
     if not TELEGRAM_BOT_TOKEN:
-        print(text)
-        return 0
+        print(text); return 0
     
+    # If specific chat_id provided (e.g. for command responses), send only to that one
     if chat_id:
         try:
             async with httpx.AsyncClient(timeout=10) as client:
@@ -260,6 +214,7 @@ async def send_telegram(text: str, chat_id: str = None) -> int:
             log.error(f"[TG] Send failed to {chat_id}: {e}")
         return 0
     
+    # Broadcast mode: send to all configured channels
     if not CHAT_IDS:
         return 0
     
@@ -278,89 +233,44 @@ async def send_telegram(text: str, chat_id: str = None) -> int:
             log.error(f"[TG] Send failed to {cid}: {e}")
     return last_msg_id
 
-async def setup_telegram_webhook():
-    """Setup webhook for Telegram (no more 409s)"""
-    if not TELEGRAM_BOT_TOKEN or not RAILWAY_DOMAIN:
-        log.info("[TG] Webhook mode disabled (no token or domain)")
-        return False
-    
-    webhook_url = f"https://{RAILWAY_DOMAIN}/webhook/{TELEGRAM_BOT_TOKEN}"
-    
+async def delete_telegram_webhook():
+    if not TELEGRAM_BOT_TOKEN: return False
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            # Delete any existing webhook/polling
-            log.info("[TG] Deleting old webhook...")
-            await client.post(
+            resp = await client.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
                 json={"drop_pending_updates": True}
             )
-            await asyncio.sleep(2)
-            
-            # Set new webhook
-            log.info(f"[TG] Setting webhook...")
-            resp = await client.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook",
-                json={
-                    "url": webhook_url,
-                    "allowed_updates": ["message"],
-                    "drop_pending_updates": True
-                }
-            )
-            result = resp.json()
-            if result.get("ok"):
-                log.info(f"[TG] Webhook active: {webhook_url}")
+            if resp.status_code == 200 and resp.json().get("ok"):
+                log.info("[TG] Webhook deleted")
                 return True
-            else:
-                log.error(f"[TG] Webhook failed: {result}")
-                return False
     except Exception as e:
-        log.error(f"[TG] Webhook setup error: {e}")
-        return False
+        log.warning(f"[TG] Webhook deletion error: {e}")
+    return False
 
-async def process_update(update: dict):
-    """Process Telegram command from webhook"""
+async def get_telegram_updates(offset: int = 0) -> list:
+    if not TELEGRAM_BOT_TOKEN: return []
     try:
-        msg = update.get("message", {})
-        text = msg.get("text", "").strip()
-        chat_id = str(msg.get("chat", {}).get("id", ""))
-        
-        if not text.startswith("/"):
-            return
-            
-        parts = text.split(maxsplit=1)
-        cmd = parts[0].lower().split('@')[0]
-        args = parts[1] if len(parts) > 1 else ""
-        
-        log.info(f"[CMD] {cmd} from {chat_id}")
-        
-        # Command routing
-        if cmd == "/trading":
-            await handle_trading_command(chat_id, args)
-        elif cmd == "/status":
-            await send_telegram(format_status(), chat_id)
-        elif cmd == "/leaderboard":
-            records = await _get_records_since_async(utcnow() - timedelta(days=1))
-            await send_telegram(format_leaderboard(records, "24H"), chat_id)
-        elif cmd == "/weekly":
-            records = await _get_records_since_async(utcnow() - timedelta(days=7))
-            await send_telegram(format_leaderboard(records, "7D"), chat_id)
-        elif cmd == "/monthly":
-            records = await _get_records_since_async(utcnow() - timedelta(days=30))
-            await send_telegram(format_leaderboard(records, "30D"), chat_id)
-        elif cmd == "/narratives":
-            await send_telegram(format_narratives(), chat_id)
-        elif cmd == "/tracking":
-            await send_telegram(format_tracking(), chat_id)
-        elif cmd == "/help":
-            await send_telegram(format_help(), chat_id)
-        else:
-            await send_telegram(f"❓ Unknown: {cmd}\nTry /help", chat_id)
-            
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                params={"offset": offset, "timeout": 25, "allowed_updates": ["message"]}
+            )
+            if resp.status_code == 200:
+                return resp.json().get("result", [])
+            elif resp.status_code == 409:
+                log.warning("[TG] 409 Conflict")
+                await asyncio.sleep(5)
     except Exception as e:
-        log.error(f"[CMD] Process error: {e}")
+        log.debug(f"[TG] Updates error: {e}")
+    return []
 
 # ─── DexScreener Fetcher ───────────────────────────────────────────────────────
 async def fetch_dexscreener(mint: str) -> dict:
+    """
+    Fetch token data from DexScreener — free, no API key, indexes pump.fun fast.
+    Returns normalized dict with same keys as Birdeye enrichment, or {} on failure.
+    """
     try:
         async with httpx.AsyncClient(timeout=8) as client:
             resp = await client.get(
@@ -373,6 +283,7 @@ async def fetch_dexscreener(mint: str) -> dict:
             if not pairs:
                 return {}
 
+            # Use the pair with highest liquidity (usually the main pool)
             pair = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
 
             liquidity  = float((pair.get("liquidity") or {}).get("usd") or 0)
@@ -396,6 +307,7 @@ async def fetch_dexscreener(mint: str) -> dict:
                 "price_change_5m_pct":  pc_m5,
                 "buy_sell_ratio_1h":    buys_h1 / max(sells_h1, 1),
                 "lp_locked":            liquidity > 5000,
+                # DexScreener doesn't provide holder breakdown — leave defaults
             }
     except Exception as e:
         log.warning(f"[DexScreener] Error {mint[:12]}: {e}")
@@ -513,7 +425,7 @@ def format_leaderboard(records: list, period: str) -> str:
     return "\n".join(lines)
 
 def format_status() -> str:
-    uptime     = utcnow() - bot_start_time if bot_start_time else timedelta(0)
+    uptime     = utcnow() - bot_start_time
     hours      = int(uptime.total_seconds() // 3600)
     mins       = int((uptime.total_seconds() % 3600) // 60)
     active     = len(tracked)
@@ -576,6 +488,7 @@ def format_help() -> str:
 # ─── MCap Fetcher (tracker) ────────────────────────────────────────────────────
 @retry_on_429(max_retries=3, base_delay=2.0)
 async def get_current_mcap(mint: str) -> Tuple[float, bool]:
+    """Try Birdeye first, fall back to DexScreener for tracked tokens."""
     if BIRDEYE_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=8) as client:
@@ -596,6 +509,7 @@ async def get_current_mcap(mint: str) -> Tuple[float, bool]:
         except Exception as e:
             log.warning(f"[MCap/Birdeye] {mint[:12]}: {e}")
 
+    # Fallback to DexScreener
     try:
         dex = await fetch_dexscreener(mint)
         if dex.get("mcap_usd", 0) > 0:
@@ -631,6 +545,10 @@ async def verify_raydium_pool(mint: str) -> bool:
 # ─── Token Enrichment ──────────────────────────────────────────────────────────
 @retry_on_429(max_retries=2, base_delay=1.0)
 async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> Tuple[dict, str]:
+    """
+    Returns (token_data, source) where source is 'birdeye', 'dexscreener', or 'none'.
+    Caller must check source != 'none' before scoring.
+    """
     base = {
         "mint": mint, "name": name, "symbol": symbol, "deployer": deployer,
         "age_hours": 0.5, "mcap_usd": 0, "liquidity_usd": 0,
@@ -646,6 +564,7 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> Tupl
     }
     source = "none"
 
+    # ── Helius: mint/freeze authority + deployer holdings ──────────────────────────
     if HELIUS_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=8) as client:
@@ -664,6 +583,7 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> Tupl
                         supply = float(info.get("supply", 0)) / (10 ** info.get("decimals", 0))
                         base["total_supply"] = supply
                         
+                        # Get deployer's token balance
                         if supply > 0 and deployer:
                             balance_resp = await client.post(
                                 f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
@@ -679,9 +599,12 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> Tupl
                                     log.info(f"  -> Dev wallet: {deployer_balance:,.0f} / {supply:,.0f} ({base['dev_holds_pct']:.1f}%)")
                                 else:
                                     log.info(f"  -> Dev wallet: no token accounts found")
+                            else:
+                                log.warning(f"  -> Dev balance check failed: {balance_resp.status_code}")
         except Exception as e:
             log.warning(f"[Helius] {mint[:12]}: {e}")
 
+    # ── Birdeye: full market data ───────────────────────────────────────────
     if BIRDEYE_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=8) as client:
@@ -715,6 +638,7 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> Tupl
         except Exception as e:
             log.warning(f"[Birdeye] {mint[:12]}: {e}")
 
+    # ── DexScreener fallback ────────────────────────────────────────────────
     if source == "none":
         dex = await fetch_dexscreener(mint)
         if dex.get("mcap_usd", 0) > 0 or dex.get("liquidity_usd", 0) > 0:
@@ -806,6 +730,7 @@ async def _get_records_since_async(cutoff: datetime) -> List[dict]:
 
 # ─── Position Monitor ──────────────────────────────────────────────────────────
 async def monitor_positions():
+    """Background task to monitor positions and execute exits"""
     if not TRADING_ENABLED or not trading_engine:
         return
     
@@ -813,7 +738,7 @@ async def monitor_positions():
     
     while True:
         try:
-            await asyncio.sleep(30)
+            await asyncio.sleep(30)  # Check every 30 seconds
             
             active_positions = position_manager.get_active_positions()
             if not active_positions:
@@ -821,12 +746,15 @@ async def monitor_positions():
             
             for pos in active_positions:
                 try:
+                    # Get current price
                     current_mcap, _ = await get_current_mcap(pos.mint)
                     if current_mcap == 0:
                         continue
                     
+                    # Calculate current price per token
                     current_price_sol = (current_mcap / 1_000_000_000) if current_mcap > 0 else pos.entry_price_sol
                     
+                    # Check exit conditions
                     exit_msg = await trading_engine.check_and_execute_exits(
                         mint=pos.mint,
                         current_price_sol=current_price_sol,
@@ -846,12 +774,14 @@ async def monitor_positions():
 
 # ─── Trading Command Handlers ───────────────────────────────────────────────────
 async def handle_trading_command(chat_id: str, args: str):
+    """Handle /trading subcommands"""
     if not TRADING_ENABLED:
         await send_telegram("⚠️ Trading not enabled", chat_id)
         return
     
     parts = args.strip().split()
     if not parts:
+        # /trading with no args = status
         await send_trading_status(chat_id)
         return
     
@@ -875,6 +805,7 @@ async def handle_trading_command(chat_id: str, args: str):
         await send_telegram(f"Unknown /trading command: {subcmd}\nTry /trading status", chat_id)
 
 async def send_trading_status(chat_id: str):
+    """Send trading status"""
     status = trading_engine.get_status_summary()
     config = trading_config
     
@@ -901,6 +832,7 @@ async def send_trading_status(chat_id: str):
     await send_telegram(msg, chat_id)
 
 async def send_positions_list(chat_id: str):
+    """Send list of active positions"""
     positions = position_manager.get_active_positions()
     
     if not positions:
@@ -919,6 +851,7 @@ async def send_positions_list(chat_id: str):
     await send_telegram(msg, chat_id)
 
 async def send_pnl_summary(chat_id: str):
+    """Send PnL summary"""
     total_pnl = position_manager.get_total_pnl()
     daily_pnl = position_manager.get_daily_pnl()
     
@@ -939,14 +872,66 @@ async def send_pnl_summary(chat_id: str):
     
     await send_telegram(msg, chat_id)
 
+# ─── Command Handler ───────────────────────────────────────────────────────────
+async def handle_commands():
+    offset = 0
+    log.info("[CMD] Command listener started")
+
+    async def _send_leaderboard(chat_id: str, days: int):
+        records = await _get_records_since_async(utcnow() - timedelta(days=days))
+        period_name = "24H" if days == 1 else f"{days}D"
+        await send_telegram(format_leaderboard(records, period_name), chat_id)
+
+    commands = {
+        '/status':      lambda cid: send_telegram(format_status(), cid),
+        '/leaderboard': lambda cid: _send_leaderboard(cid, 1),
+        '/weekly':      lambda cid: _send_leaderboard(cid, 7),
+        '/monthly':     lambda cid: _send_leaderboard(cid, 30),
+        '/narratives':  lambda cid: send_telegram(format_narratives(), cid),
+        '/tracking':    lambda cid: send_telegram(format_tracking(), cid),
+        '/help':        lambda cid: send_telegram(format_help(), cid),
+    }
+
+    while True:
+        try:
+            updates = await get_telegram_updates(offset)
+            for update in updates:
+                offset  = update["update_id"] + 1
+                msg     = update.get("message", {})
+                text    = msg.get("text", "").strip()
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                if not text.startswith("/"): continue
+                
+                # Parse command and args
+                parts = text.split(maxsplit=1)
+                cmd = parts[0].lower().split('@')[0]
+                args = parts[1] if len(parts) > 1 else ""
+                
+                log.info(f"[CMD] {cmd} from user")
+                
+                # Handle /trading specially (has subcommands)
+                if cmd == "/trading":
+                    await handle_trading_command(chat_id, args)
+                    continue
+                
+                if cmd in commands:
+                    await commands[cmd](chat_id)
+                else:
+                    await send_telegram(f"❓ Unknown: {cmd}\nTry /help", chat_id)
+        except Exception as e:
+            log.error(f"[CMD] Loop error: {e}")
+            await asyncio.sleep(5)
+        await asyncio.sleep(0.1)
+
 # ─── Main Bot Loop ─────────────────────────────────────────────────────────────
 async def run_bot():
-    global sniper_ref, total_alerts_fired, bot_start_time, trading_engine, trader, position_manager, trading_config, TRADING_ENABLED
-    
+    global sniper_ref, total_alerts_fired, bot_start_time
     bot_start_time = utcnow()
     load_leaderboard()
 
     # Initialize trading if enabled
+    global trading_engine, trader, position_manager, trading_config, TRADING_ENABLED
+    
     if TRADING_ENABLED and SOLANA_PRIVATE_KEY:
         try:
             trader = SolanaTrader(SOLANA_PRIVATE_KEY)
@@ -963,7 +948,7 @@ async def run_bot():
     else:
         log.info("[TRADING] Disabled - no private key configured")
 
-    sniper = SolanaNarrativeSniper()
+    sniper     = SolanaNarrativeSniper()
     sniper_ref = sniper
 
     seed = os.getenv("SEED_NARRATIVES", "")
@@ -986,9 +971,9 @@ async def run_bot():
     log.info(f"  Helius: {'on' if HELIUS_API_KEY else 'off'}  Birdeye: {'on' if BIRDEYE_API_KEY else 'off'}")
     log.info("=" * 50)
 
-    # Setup Telegram webhook (replaces polling)
     if TELEGRAM_BOT_TOKEN:
-        await setup_telegram_webhook()
+        await delete_telegram_webhook()
+        await asyncio.sleep(2)
 
     await send_telegram(
         "🎯 <b>TekkiSniPer ONLINE</b> [v2.4]\n"
@@ -1002,8 +987,10 @@ async def run_bot():
         asyncio.create_task(_bot_loop(sniper)),
         asyncio.create_task(track_tokens()),
         asyncio.create_task(leaderboard_scheduler()),
+        asyncio.create_task(handle_commands()),
     ]
     
+    # Add trading monitor if enabled
     if TRADING_ENABLED and trading_engine:
         tasks.append(asyncio.create_task(monitor_positions()))
     
@@ -1011,17 +998,10 @@ async def run_bot():
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
         log.info("[BOT] Shutting down...")
-        for t in tasks: 
-            t.cancel()
+        for t in tasks: t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
     except Exception as e:
-        log.critical(f"[BOT] Fatal: {e}")
-        raise
-
-def run_flask():
-    """Run Flask in background thread for webhooks and health checks"""
-    port = int(os.getenv("PORT", 8080))
-    flask_app.run(host='0.0.0.0', port=port, threaded=True, debug=False)
+        log.critical(f"[BOT] Fatal: {e}"); raise
 
 async def _bot_loop(sniper):
     retry_delay = 5
@@ -1068,10 +1048,8 @@ async def handle_token(sniper, msg: dict):
     deployer = msg.get("traderPublicKey", "")
     desc     = msg.get("description", "")
 
-    if not mint or not name: 
-        return
-    if len(mint) < 32 or len(mint) > 44: 
-        return
+    if not mint or not name: return
+    if len(mint) < 32 or len(mint) > 44: return
 
     log.info(f"[NEW] {name} (${symbol}) {mint[:12]}...")
 
@@ -1080,36 +1058,43 @@ async def handle_token(sniper, msg: dict):
         log.info(f"  -> No narrative match")
         return
     
+    # Blacklist filter - reject obvious rugs/scams
     combined_text = f"{name} {symbol}".lower()
     for blacklisted in BLACKLIST_KEYWORDS:
         if blacklisted in combined_text:
             log.info(f"  -> Blacklisted keyword '{blacklisted}' detected — skip")
             return
 
+    # Wait 90s then fetch (gives pools time to form and Birdeye time to index)
     await asyncio.sleep(90)
     token_data, source = await enrich_token(mint, name, symbol, deployer)
     token_data["description"] = desc
 
+    # If no market data yet, wait 60s and try once more
     if source == "none":
         log.info(f"  -> No market data yet — retrying in 60s...")
         await asyncio.sleep(60)
         token_data, source = await enrich_token(mint, name, symbol, deployer)
         token_data["description"] = desc
 
+    # Skip if still no data from either source
     if source == "none":
         log.info(f"  -> No data from Birdeye or DexScreener — skip")
         return
 
     log.info(f"  -> Source: {source}  liq=${token_data['liquidity_usd']:,.0f}  mcap=${token_data['mcap_usd']:,.0f}")
 
+    # Liquidity filter
     if token_data["liquidity_usd"] < MIN_LIQUIDITY:
         log.info(f"  -> LP ${token_data['liquidity_usd']:,.0f} < ${MIN_LIQUIDITY:,.0f} — skip")
         return
     
+    # MCap filter (prefer micro caps with more upside)
     if token_data.get("mcap_usd", 0) > MAX_ENTRY_MCAP:
         log.info(f"  -> MCap ${token_data['mcap_usd']:,.0f} > ${MAX_ENTRY_MCAP:,.0f} — skip")
         return
 
+    # Holder filters (only when source provides real holder data)
     if source == "birdeye":
         if token_data["top1_pct"] > 10:
             log.info(f"  -> Top1 {token_data['top1_pct']:.1f}% > 10% — skip")
@@ -1117,6 +1102,7 @@ async def handle_token(sniper, msg: dict):
         if token_data["top10_pct"] > 40:
             log.info(f"  -> Top10 {token_data['top10_pct']:.1f}% > 40% — skip")
             return
+        # Dev holds filter (only when Birdeye has real data)
         if token_data.get("dev_holds_pct", 0) > 5.0:
             log.info(f"  -> Dev holds {token_data['dev_holds_pct']:.1f}% > 5% — skip")
             return
@@ -1132,6 +1118,7 @@ async def handle_token(sniper, msg: dict):
         log.info(f"  🎯 FIRING — {name} (${symbol})  [{source}]")
         await send_telegram(format_alert(alert))
         
+        # Auto-buy if trading enabled
         if TRADING_ENABLED and trading_engine:
             try:
                 success, trade_msg, position = await trading_engine.execute_buy(
@@ -1157,16 +1144,9 @@ async def handle_token(sniper, msg: dict):
             asyncio.create_task(save_leaderboard_async())
 
 if __name__ == "__main__":
-    # Start Flask in background thread for webhooks/health checks
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    log.info("[MAIN] Flask server started for webhooks")
-    
-    # Run main bot
     try:
         asyncio.run(run_bot())
     except KeyboardInterrupt:
         log.info("[MAIN] Interrupted")
     except Exception as e:
-        log.critical(f"[MAIN] Fatal: {e}")
-        raise
+        log.critical(f"[MAIN] Fatal: {e}"); raise
