@@ -14,12 +14,16 @@ NARRATIVE_CATEGORIES = {
         "gpt", "claude", "clawd", "gemini", "llm", "agi", "sora", "devin", "operator",
         "ai agent", "autonomous", "reasoning model", "o3", "o4", "openai", "anthropic",
         "deepseek", "qwen", "mistral", "groq", "inference", "multimodal", "ai", "agent",
-        "aixbt", "labs", "router", "bytedance", "perplexity", "grok"
+        "aixbt", "labs", "router", "bytedance", "perplexity", "grok",
+        # 2026 additions
+        "chatgpt", "sam altman", "nvidia", "meta"
     ],
     "animals": [
         "dog", "cat", "frog", "pepe", "bird", "hamster", "penguin", "bear", "wolf",
         "shiba", "doge", "seal", "capybara", "raccoon", "owl", "fox", "goat", "duck",
-        "inu", "monkey", "panda", "hippo", "luna", "dragon", "tiger", "rabbit", "snake"
+        "inu", "monkey", "panda", "hippo", "luna", "dragon", "tiger", "rabbit", "snake",
+        # 2026 additions
+        "corgi", "shib", "lobstar", "openclaw", "molty", "claw", "lobster"
     ],
     "culture_meme": [
         "gigachad", "wojak", "npc", "sigma", "based", "irl", "brainrot", "skibidi",
@@ -27,7 +31,9 @@ NARRATIVE_CATEGORIES = {
         # nostalgia/throwback memes
         "harambe", "shrek", "ugandan", "dat boi", "nyan", "grumpy", "leeroy",
         "rickroll", "gangnam", "harlem", "planking", "mlg", "doritos", "fedora",
-        "hotdog", "numa"
+        "hotdog", "numa",
+        # 2026 additions
+        "apu", "bobo", "sminem", "bogdanoff", "alpha", "cheems"
     ],
     "politics_geo": [
         "whitehouse", "executive", "tariff", "election", "vote", "political", "wlfi",
@@ -44,11 +50,15 @@ NARRATIVE_CATEGORIES = {
     ],
     "gaming_virtual": [
         "minecraft", "roblox", "fortnite", "gta", "pokemon", "zelda", "anime",
-        "vtuber", "streaming", "twitch", "esport", "speedrun", "nft", "metaverse"
+        "vtuber", "streaming", "twitch", "esport", "speedrun", "nft", "metaverse",
+        # 2026 additions
+        "gta6", "call of duty", "apex"
     ],
     "finance_macro": [
         "fed", "inflation", "recession", "btc", "eth", "rate cut", "rate hike",
-        "black swan", "bubble", "crash", "bull", "bear", "halving", "etf"
+        "black swan", "bubble", "crash", "bull", "bear", "halving", "etf",
+        # 2026 additions
+        "vitalik", "cz", "sbf", "do kwon", "coin", "crypto"
     ]
 }
 
