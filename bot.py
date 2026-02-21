@@ -30,6 +30,16 @@ import websockets
 sys.path.insert(0, str(Path(__file__).parent))
 from sniper import SolanaNarrativeSniper
 
+# Trading imports
+try:
+    from core.trader import SolanaTrader
+    from core.position_manager import PositionManager
+    from core.trading_config import TradingConfig
+    from core.trading_engine import TradingEngine
+    TRADING_AVAILABLE = True
+except ImportError as e:
+    TRADING_AVAILABLE = False
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -49,6 +59,10 @@ BIRDEYE_API_KEY    = os.getenv("BIRDEYE_API_KEY", "")
 ALERT_THRESHOLD    = float(os.getenv("ALERT_THRESHOLD", "5.0"))
 MIN_LIQUIDITY      = float(os.getenv("MIN_LIQUIDITY_USD", "5000"))
 MAX_ENTRY_MCAP     = float(os.getenv("MAX_ENTRY_MCAP", "100000"))
+
+# Trading configuration
+SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY", "")
+TRADING_ENABLED = TRADING_AVAILABLE and bool(SOLANA_PRIVATE_KEY)
 
 # Blacklist - reject tokens with these keywords even if they match narratives
 BLACKLIST_KEYWORDS_STR = os.getenv("BLACKLIST_KEYWORDS", "inu,wif,wif hat,with hat")
@@ -115,6 +129,12 @@ leaderboard_history: List[dict] = []
 sniper_ref: Optional[SolanaNarrativeSniper] = None
 bot_start_time: datetime = utcnow()
 total_alerts_fired: int = 0
+
+# Trading globals  
+trading_engine: Optional['TradingEngine'] = None
+trader: Optional['SolanaTrader'] = None
+position_manager: Optional['PositionManager'] = None
+trading_config: Optional['TradingConfig'] = None
 
 # ─── Persistence ───────────────────────────────────────────────────────────────
 async def save_leaderboard_async():
@@ -708,6 +728,150 @@ async def _get_records_since_async(cutoff: datetime) -> List[dict]:
                 continue
     return records
 
+# ─── Position Monitor ──────────────────────────────────────────────────────────
+async def monitor_positions():
+    """Background task to monitor positions and execute exits"""
+    if not TRADING_ENABLED or not trading_engine:
+        return
+    
+    log.info("[TRADING] Position monitor started")
+    
+    while True:
+        try:
+            await asyncio.sleep(30)  # Check every 30 seconds
+            
+            active_positions = position_manager.get_active_positions()
+            if not active_positions:
+                continue
+            
+            for pos in active_positions:
+                try:
+                    # Get current price
+                    current_mcap, _ = await get_current_mcap(pos.mint)
+                    if current_mcap == 0:
+                        continue
+                    
+                    # Calculate current price per token
+                    current_price_sol = (current_mcap / 1_000_000_000) if current_mcap > 0 else pos.entry_price_sol
+                    
+                    # Check exit conditions
+                    exit_msg = await trading_engine.check_and_execute_exits(
+                        mint=pos.mint,
+                        current_price_sol=current_price_sol,
+                        current_mcap=current_mcap
+                    )
+                    
+                    if exit_msg:
+                        await send_telegram(exit_msg)
+                        log.info(f"[TRADING] Exit executed: {pos.symbol}")
+                
+                except Exception as e:
+                    log.error(f"[TRADING] Position check error {pos.symbol}: {e}")
+        
+        except Exception as e:
+            log.error(f"[TRADING] Monitor loop error: {e}")
+            await asyncio.sleep(5)
+
+# ─── Trading Command Handlers ───────────────────────────────────────────────────
+async def handle_trading_command(chat_id: str, args: str):
+    """Handle /trading subcommands"""
+    if not TRADING_ENABLED:
+        await send_telegram("⚠️ Trading not enabled", chat_id)
+        return
+    
+    parts = args.strip().split()
+    if not parts:
+        # /trading with no args = status
+        await send_trading_status(chat_id)
+        return
+    
+    subcmd = parts[0].lower()
+    
+    if subcmd == "status":
+        await send_trading_status(chat_id)
+    elif subcmd == "positions":
+        await send_positions_list(chat_id)
+    elif subcmd == "pnl":
+        await send_pnl_summary(chat_id)
+    elif subcmd == "pause":
+        trading_config.auto_buy_enabled = False
+        trading_config.save()
+        await send_telegram("⏸ Auto-buy PAUSED", chat_id)
+    elif subcmd == "resume":
+        trading_config.auto_buy_enabled = True
+        trading_config.save()
+        await send_telegram("▶️ Auto-buy RESUMED", chat_id)
+    else:
+        await send_telegram(f"Unknown /trading command: {subcmd}\nTry /trading status", chat_id)
+
+async def send_trading_status(chat_id: str):
+    """Send trading status"""
+    status = trading_engine.get_status_summary()
+    config = trading_config
+    
+    mode = "📝 PAPER" if status["paper_mode"] else "💰 LIVE"
+    auto = "✅ ON" if status["auto_buy"] else "⏸ PAUSED"
+    
+    msg = f"🤖 <b>TRADING STATUS</b> {mode}\n\n"
+    msg += f"Auto-buy: {auto}\n"
+    msg += f"Positions: {status['active_positions']}/{status['max_positions']}\n"
+    msg += f"Deployed: {status['total_deployed_sol']:.3f} SOL\n"
+    msg += f"Buy amount: {status['buy_amount_sol']} SOL\n\n"
+    
+    msg += f"<b>Strategy</b>\n"
+    msg += f"Take Profit: {config.tp1_x}X (sell {config.tp1_sell_pct}%)\n"
+    msg += f"Stop Loss: -{config.stop_loss_pct}%\n"
+    msg += f"Trailing Stop: {'ON' if config.trailing_stop_enabled else 'OFF'}\n"
+    msg += f"Max Hold: {config.max_hold_time_hours}h\n\n"
+    
+    msg += f"<b>PnL</b>\n"
+    msg += f"Total: {status['total_pnl_sol']:+.4f} SOL\n"
+    msg += f"Today: {status['daily_pnl_sol']:+.4f} SOL\n\n"
+    msg += f"Daily buys: {status['daily_buys']}/{status['max_daily_buys']}"
+    
+    await send_telegram(msg, chat_id)
+
+async def send_positions_list(chat_id: str):
+    """Send list of active positions"""
+    positions = position_manager.get_active_positions()
+    
+    if not positions:
+        await send_telegram("No active positions", chat_id)
+        return
+    
+    msg = f"📊 <b>OPEN POSITIONS ({len(positions)})</b>\n\n"
+    
+    for pos in sorted(positions, key=lambda p: p.current_x, reverse=True):
+        pnl_emoji = "🟢" if pos.total_pnl_sol() >= 0 else "🔴"
+        msg += f"{pnl_emoji} <b>{pos.name}</b> <code>${pos.symbol}</code>\n"
+        msg += f"   Entry: {pos.entry_sol} SOL @ {pos.current_x:.2f}X\n"
+        msg += f"   PnL: {pos.pnl_pct():+.1f}% ({pos.total_pnl_sol():+.4f} SOL)\n"
+        msg += f"   Age: {pos.age_hours():.1f}h | Peak: {pos.peak_x:.2f}X\n\n"
+    
+    await send_telegram(msg, chat_id)
+
+async def send_pnl_summary(chat_id: str):
+    """Send PnL summary"""
+    total_pnl = position_manager.get_total_pnl()
+    daily_pnl = position_manager.get_daily_pnl()
+    
+    all_positions = position_manager.get_all_positions()
+    total_deployed = sum(p.entry_sol for p in all_positions)
+    
+    winners = len([p for p in all_positions if p.total_pnl_sol() > 0])
+    losers = len([p for p in all_positions if p.total_pnl_sol() < 0])
+    
+    win_rate = (winners / len(all_positions) * 100) if all_positions else 0
+    
+    msg = f"💰 <b>PnL SUMMARY</b>\n\n"
+    msg += f"Total PnL: <b>{total_pnl:+.4f} SOL</b>\n"
+    msg += f"Daily PnL: <b>{daily_pnl:+.4f} SOL</b>\n\n"
+    msg += f"Total traded: {total_deployed:.3f} SOL\n"
+    msg += f"Win rate: {win_rate:.1f}% ({winners}W {losers}L)\n"
+    msg += f"Positions: {len(all_positions)} total"
+    
+    await send_telegram(msg, chat_id)
+
 # ─── Command Handler ───────────────────────────────────────────────────────────
 async def handle_commands():
     offset = 0
@@ -737,8 +901,19 @@ async def handle_commands():
                 text    = msg.get("text", "").strip()
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 if not text.startswith("/"): continue
-                cmd = text.split()[0].lower().split('@')[0]
+                
+                # Parse command and args
+                parts = text.split(maxsplit=1)
+                cmd = parts[0].lower().split('@')[0]
+                args = parts[1] if len(parts) > 1 else ""
+                
                 log.info(f"[CMD] {cmd} from user")
+                
+                # Handle /trading specially (has subcommands)
+                if cmd == "/trading":
+                    await handle_trading_command(chat_id, args)
+                    continue
+                
                 if cmd in commands:
                     await commands[cmd](chat_id)
                 else:
@@ -753,6 +928,25 @@ async def run_bot():
     global sniper_ref, total_alerts_fired, bot_start_time
     bot_start_time = utcnow()
     load_leaderboard()
+
+    # Initialize trading if enabled
+    global trading_engine, trader, position_manager, trading_config, TRADING_ENABLED
+    
+    if TRADING_ENABLED and SOLANA_PRIVATE_KEY:
+        try:
+            trader = SolanaTrader(SOLANA_PRIVATE_KEY)
+            position_manager = PositionManager()
+            trading_config = TradingConfig.load()
+            trading_engine = TradingEngine(trader, position_manager, trading_config)
+            
+            log.info(f"[TRADING] Initialized - Paper mode: {trading_config.paper_trading_mode}")
+            log.info(f"[TRADING] Wallet: {trader.wallet_address}")
+            log.info(f"[TRADING] Auto-buy: {'ON' if trading_config.auto_buy_enabled else 'OFF'}")
+        except Exception as e:
+            log.error(f"[TRADING] Initialization failed: {e}")
+            TRADING_ENABLED = False
+    else:
+        log.info("[TRADING] Disabled - no private key configured")
 
     sniper     = SolanaNarrativeSniper()
     sniper_ref = sniper
@@ -795,6 +989,11 @@ async def run_bot():
         asyncio.create_task(leaderboard_scheduler()),
         asyncio.create_task(handle_commands()),
     ]
+    
+    # Add trading monitor if enabled
+    if TRADING_ENABLED and trading_engine:
+        tasks.append(asyncio.create_task(monitor_positions()))
+    
     try:
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
@@ -918,6 +1117,21 @@ async def handle_token(sniper, msg: dict):
             total_alerts_fired += 1
         log.info(f"  🎯 FIRING — {name} (${symbol})  [{source}]")
         await send_telegram(format_alert(alert))
+        
+        # Auto-buy if trading enabled
+        if TRADING_ENABLED and trading_engine:
+            try:
+                success, trade_msg, position = await trading_engine.execute_buy(
+                    mint=mint,
+                    name=name,
+                    symbol=symbol,
+                    alert_mcap=token_data.get("mcap_usd", 0)
+                )
+                if success and trade_msg:
+                    await send_telegram(trade_msg)
+            except Exception as e:
+                log.error(f"[TRADING] Auto-buy failed: {e}")
+        
         entry_mcap = token_data.get("mcap_usd", 0)
         if entry_mcap > 0:
             nar_kw = (quick.get("narrative") or {}).get("keyword", "unknown")
