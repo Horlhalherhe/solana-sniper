@@ -1053,10 +1053,11 @@ async def handle_token(sniper, msg: dict):
 
     log.info(f"[NEW] {name} (${symbol}) {mint[:12]}...")
 
+    # Check narrative (for display only, not required)
     quick = sniper.narrative_engine.match_token_to_narrative(name, symbol, desc)
-    if not quick.get("matched"):
-        log.info(f"  -> No narrative match")
-        return
+    narrative_matched = quick.get("matched", False)
+    if narrative_matched:
+        log.info(f"  -> Narrative: {quick.get('narrative', {}).get('keyword', 'unknown')}")
     
     # Blacklist filter - reject obvious rugs/scams
     combined_text = f"{name} {symbol}".lower()
