@@ -96,6 +96,34 @@ class TrackedToken:
         if self.entry_mcap <= 0:
             return 0.0
         return round(self.current_mcap / self.entry_mcap, 2)
+    
+    def classify_outcome(self):
+        """Classify token performance for analytics"""
+        x = self.current_x()
+        
+        # Success: 5X or more
+        if self.peak_x >= 5.0:
+            return "success"
+        
+        # Rugged: Down more than 50% from entry
+        elif x < 0.5 and self.status == "closed":
+            return "rugged"
+        
+        # Moderate: Hit 2-5X
+        elif self.peak_x >= 2.0 and self.peak_x < 5.0:
+            return "moderate"
+        
+        # No pump: Never hit 2X
+        elif self.peak_x < 2.0:
+            return "no_pump"
+        
+        # Still active
+        else:
+            return "active"
+    
+    def age_hours(self):
+        """Get token age in hours"""
+        return (utcnow() - self.added_at).total_seconds() / 3600
 
     def to_record(self):
         return {
@@ -462,6 +490,7 @@ def format_help() -> str:
         "/monthly         — 30 day leaderboard",
         "/narratives      — active narrative list",
         "/tracking        — tokens being tracked now",
+        "/analytics       — performance stats",
         "/help            — this menu",
     ])
 
@@ -717,6 +746,102 @@ async def handle_commands():
         records = await _get_records_since_async(utcnow() - timedelta(days=days))
         period_name = "24H" if days == 1 else f"{days}D"
         await send_telegram(format_leaderboard(records, period_name), chat_id)
+    
+    async def send_analytics(chat_id: str):
+        """Send performance analytics"""
+        
+        # Collect all tokens (active + history)
+        all_tokens = []
+        
+        async with tracked_lock:
+            all_tokens.extend(tracked.values())
+        
+        async with history_lock:
+            for record in leaderboard_history:
+                try:
+                    t = TrackedToken(
+                        mint=record["mint"],
+                        name=record["name"],
+                        symbol=record["symbol"],
+                        entry_mcap=record["entry_mcap"],
+                        entry_score=record["entry_score"],
+                        narrative=record.get("narrative", "unknown")
+                    )
+                    t.peak_x = record["peak_x"]
+                    t.current_mcap = record["current_mcap"]
+                    t.status = record["status"]
+                    all_tokens.append(t)
+                except:
+                    continue
+        
+        if not all_tokens:
+            await send_telegram("📊 No data yet. Wait for some alerts!", chat_id)
+            return
+        
+        # Classify outcomes
+        outcomes = {
+            "success": [],
+            "moderate": [],
+            "rugged": [],
+            "no_pump": [],
+            "active": []
+        }
+        
+        for t in all_tokens:
+            outcome = t.classify_outcome()
+            outcomes[outcome].append(t)
+        
+        total = len(all_tokens)
+        success_count = len(outcomes["success"])
+        moderate_count = len(outcomes["moderate"])
+        rugged_count = len(outcomes["rugged"])
+        no_pump_count = len(outcomes["no_pump"])
+        active_count = len(outcomes["active"])
+        
+        # Calculate averages
+        avg_score_success = sum(t.entry_score for t in outcomes["success"]) / len(outcomes["success"]) if outcomes["success"] else 0
+        avg_score_failure = sum(t.entry_score for t in outcomes["no_pump"]) / len(outcomes["no_pump"]) if outcomes["no_pump"] else 0
+        
+        # Build message
+        msg = f"📊 <b>PERFORMANCE ANALYTICS</b>\n\n"
+        msg += f"<b>Total Alerts:</b> {total}\n\n"
+        
+        msg += f"<b>Outcomes:</b>\n"
+        msg += f"✅ Success (≥5X): {success_count} ({success_count/total*100:.1f}%)\n"
+        msg += f"⚠️  Moderate (2-5X): {moderate_count} ({moderate_count/total*100:.1f}%)\n"
+        msg += f"💀 Rugged: {rugged_count} ({rugged_count/total*100:.1f}%)\n"
+        msg += f"📉 No Pump (<2X): {no_pump_count} ({no_pump_count/total*100:.1f}%)\n"
+        msg += f"⏳ Active: {active_count}\n\n"
+        
+        msg += f"<b>Entry Score Analysis:</b>\n"
+        msg += f"Success avg: {avg_score_success:.1f}/10\n"
+        msg += f"Failure avg: {avg_score_failure:.1f}/10\n\n"
+        
+        # Top performers
+        if outcomes["success"]:
+            top_3 = sorted(outcomes["success"], key=lambda t: t.peak_x, reverse=True)[:3]
+            msg += f"<b>🔥 Top Performers:</b>\n"
+            for i, t in enumerate(top_3, 1):
+                msg += f"{i}. {t.name} - {t.peak_x:.1f}X\n"
+            msg += "\n"
+        
+        # Worst performers
+        if outcomes["rugged"]:
+            msg += f"<b>💀 Rugged ({len(outcomes['rugged'])}):</b>\n"
+            for t in outcomes["rugged"][:3]:
+                msg += f"- {t.name}\n"
+            msg += "\n"
+        
+        # Success rate and recommendation
+        success_rate = (success_count / total * 100) if total > 0 else 0
+        msg += f"<b>📈 Success Rate: {success_rate:.1f}%</b>\n"
+        
+        if success_rate < 30:
+            msg += "\n⚠️ <i>Consider raising filters</i>"
+        elif success_rate > 50:
+            msg += "\n✅ <i>Great performance!</i>"
+        
+        await send_telegram(msg, chat_id)
 
     commands = {
         '/status':      lambda cid: send_telegram(format_status(), cid),
@@ -725,6 +850,7 @@ async def handle_commands():
         '/monthly':     lambda cid: _send_leaderboard(cid, 30),
         '/narratives':  lambda cid: send_telegram(format_narratives(), cid),
         '/tracking':    lambda cid: send_telegram(format_tracking(), cid),
+        '/analytics':   lambda cid: send_analytics(cid),
         '/help':        lambda cid: send_telegram(format_help(), cid),
     }
 
@@ -912,7 +1038,14 @@ async def handle_token(sniper, msg: dict):
     alert       = sniper.analyze_token(token_data)
     entry_score = alert.entry.get("final_score", 0)
     rug_score   = alert.rug.get("rug_score", 10)
+    flags       = alert.rug.get("flags", [])
     log.info(f"  -> Entry: {entry_score}/10  Rug: {rug_score}/10  {alert.entry.get('verdict','')}")
+    
+    # Critical: Flags must be NONE (no red flags allowed)
+    if flags and len(flags) > 0:
+        flag_codes = [f['code'] for f in flags[:3]]
+        log.info(f"  -> Flags detected {flag_codes} — skip")
+        return
 
     if entry_score >= ALERT_THRESHOLD:
         async with alerts_lock:
