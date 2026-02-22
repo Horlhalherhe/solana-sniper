@@ -985,6 +985,8 @@ async def handle_token(sniper, msg: dict):
     narrative_matched = quick.get("matched", False)
     if narrative_matched:
         log.info(f"  -> Narrative: {quick.get('narrative', {}).get('keyword', 'unknown')}")
+    else:
+        log.info(f"  -> No narrative match (proceeding to quality check)")
     
     # Blacklist filter - reject obvious rugs/scams
     combined_text = f"{name} {symbol}".lower()
@@ -993,8 +995,8 @@ async def handle_token(sniper, msg: dict):
             log.info(f"  -> Blacklisted keyword '{blacklisted}' detected — skip")
             return
 
-    # Wait 90s then fetch (gives pools time to form and Birdeye time to index)
-    await asyncio.sleep(90)
+    # Wait 150s then fetch (gives pools time to form and DexScreener time to index)
+    await asyncio.sleep(150)
     token_data, source = await enrich_token(mint, name, symbol, deployer)
     token_data["description"] = desc
 
