@@ -267,10 +267,14 @@ async def get_telegram_updates(offset: int = 0) -> list:
             if resp.status_code == 200:
                 return resp.json().get("result", [])
             elif resp.status_code == 409:
-                log.warning("[TG] 409 Conflict")
+                log.warning("[TG] 409 Conflict - webhook still active?")
                 await asyncio.sleep(5)
+            else:
+                log.error(f"[TG] Updates failed: status {resp.status_code}")
+    except httpx.TimeoutException:
+        log.warning("[TG] Timeout getting updates (normal if no messages)")
     except Exception as e:
-        log.debug(f"[TG] Updates error: {e}")
+        log.error(f"[TG] Updates error: {e}")
     return []
 
 # ─── DexScreener Fetcher ───────────────────────────────────────────────────────
@@ -740,6 +744,7 @@ async def _get_records_since_async(cutoff: datetime) -> List[dict]:
 # ─── Command Handler ───────────────────────────────────────────────────────────
 async def handle_commands():
     offset = 0
+    last_heartbeat = utcnow()
     log.info("[CMD] Command listener started")
 
     async def _send_leaderboard(chat_id: str, days: int):
@@ -871,7 +876,17 @@ async def handle_commands():
 
     while True:
         try:
+            # Heartbeat every 10 minutes
+            if (utcnow() - last_heartbeat).total_seconds() > 600:
+                log.info("[CMD] Heartbeat - command handler alive")
+                last_heartbeat = utcnow()
+            
             updates = await get_telegram_updates(offset)
+            if not updates:
+                # No updates - normal, just wait
+                await asyncio.sleep(1)
+                continue
+                
             for update in updates:
                 offset  = update["update_id"] + 1
                 msg     = update.get("message", {})
@@ -880,10 +895,14 @@ async def handle_commands():
                 if not text.startswith("/"): continue
                 cmd = text.split()[0].lower().split('@')[0]
                 log.info(f"[CMD] {cmd} from user")
-                if cmd in commands:
-                    await commands[cmd](chat_id)
-                else:
-                    await send_telegram(f"❓ Unknown: {cmd}\nTry /help", chat_id)
+                try:
+                    if cmd in commands:
+                        await commands[cmd](chat_id)
+                    else:
+                        await send_telegram(f"❓ Unknown: {cmd}\nTry /help", chat_id)
+                except Exception as cmd_error:
+                    log.error(f"[CMD] Error executing {cmd}: {cmd_error}")
+                    await send_telegram(f"⚠️ Error executing {cmd}", chat_id)
         except Exception as e:
             log.error(f"[CMD] Loop error: {e}")
             await asyncio.sleep(5)
