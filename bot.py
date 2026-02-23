@@ -749,99 +749,107 @@ async def handle_commands():
     
     async def send_analytics(chat_id: str):
         """Send performance analytics"""
-        
-        # Collect all tokens (active + history)
-        all_tokens = []
-        
-        async with tracked_lock:
-            all_tokens.extend(tracked.values())
-        
-        async with history_lock:
-            for record in leaderboard_history:
+        try:
+            # Collect all tokens (active + history)
+            all_tokens = []
+            
+            async with tracked_lock:
+                all_tokens.extend(tracked.values())
+            
+            async with history_lock:
+                for record in leaderboard_history:
+                    try:
+                        t = TrackedToken(
+                            mint=record["mint"],
+                            name=record["name"],
+                            symbol=record["symbol"],
+                            entry_mcap=record["entry_mcap"],
+                            entry_score=record["entry_score"],
+                            narrative=record.get("narrative", "unknown")
+                        )
+                        t.peak_x = record["peak_x"]
+                        t.current_mcap = record["current_mcap"]
+                        t.status = record["status"]
+                        all_tokens.append(t)
+                    except Exception as e:
+                        log.warning(f"[ANALYTICS] Skip record: {e}")
+                        continue
+            
+            if not all_tokens:
+                await send_telegram("📊 No data yet. Wait for some alerts!", chat_id)
+                return
+            
+            # Classify outcomes
+            outcomes = {
+                "success": [],
+                "moderate": [],
+                "rugged": [],
+                "no_pump": [],
+                "active": []
+            }
+            
+            for t in all_tokens:
                 try:
-                    t = TrackedToken(
-                        mint=record["mint"],
-                        name=record["name"],
-                        symbol=record["symbol"],
-                        entry_mcap=record["entry_mcap"],
-                        entry_score=record["entry_score"],
-                        narrative=record.get("narrative", "unknown")
-                    )
-                    t.peak_x = record["peak_x"]
-                    t.current_mcap = record["current_mcap"]
-                    t.status = record["status"]
-                    all_tokens.append(t)
-                except:
-                    continue
-        
-        if not all_tokens:
-            await send_telegram("📊 No data yet. Wait for some alerts!", chat_id)
-            return
-        
-        # Classify outcomes
-        outcomes = {
-            "success": [],
-            "moderate": [],
-            "rugged": [],
-            "no_pump": [],
-            "active": []
-        }
-        
-        for t in all_tokens:
-            outcome = t.classify_outcome()
-            outcomes[outcome].append(t)
-        
-        total = len(all_tokens)
-        success_count = len(outcomes["success"])
-        moderate_count = len(outcomes["moderate"])
-        rugged_count = len(outcomes["rugged"])
-        no_pump_count = len(outcomes["no_pump"])
-        active_count = len(outcomes["active"])
-        
-        # Calculate averages
-        avg_score_success = sum(t.entry_score for t in outcomes["success"]) / len(outcomes["success"]) if outcomes["success"] else 0
-        avg_score_failure = sum(t.entry_score for t in outcomes["no_pump"]) / len(outcomes["no_pump"]) if outcomes["no_pump"] else 0
-        
-        # Build message
-        msg = f"📊 <b>PERFORMANCE ANALYTICS</b>\n\n"
-        msg += f"<b>Total Alerts:</b> {total}\n\n"
-        
-        msg += f"<b>Outcomes:</b>\n"
-        msg += f"✅ Success (≥5X): {success_count} ({success_count/total*100:.1f}%)\n"
-        msg += f"⚠️  Moderate (2-5X): {moderate_count} ({moderate_count/total*100:.1f}%)\n"
-        msg += f"💀 Rugged: {rugged_count} ({rugged_count/total*100:.1f}%)\n"
-        msg += f"📉 No Pump (<2X): {no_pump_count} ({no_pump_count/total*100:.1f}%)\n"
-        msg += f"⏳ Active: {active_count}\n\n"
-        
-        msg += f"<b>Entry Score Analysis:</b>\n"
-        msg += f"Success avg: {avg_score_success:.1f}/10\n"
-        msg += f"Failure avg: {avg_score_failure:.1f}/10\n\n"
-        
-        # Top performers
-        if outcomes["success"]:
-            top_3 = sorted(outcomes["success"], key=lambda t: t.peak_x, reverse=True)[:3]
-            msg += f"<b>🔥 Top Performers:</b>\n"
-            for i, t in enumerate(top_3, 1):
-                msg += f"{i}. {t.name} - {t.peak_x:.1f}X\n"
-            msg += "\n"
-        
-        # Worst performers
-        if outcomes["rugged"]:
-            msg += f"<b>💀 Rugged ({len(outcomes['rugged'])}):</b>\n"
-            for t in outcomes["rugged"][:3]:
-                msg += f"- {t.name}\n"
-            msg += "\n"
-        
-        # Success rate and recommendation
-        success_rate = (success_count / total * 100) if total > 0 else 0
-        msg += f"<b>📈 Success Rate: {success_rate:.1f}%</b>\n"
-        
-        if success_rate < 30:
-            msg += "\n⚠️ <i>Consider raising filters</i>"
-        elif success_rate > 50:
-            msg += "\n✅ <i>Great performance!</i>"
-        
-        await send_telegram(msg, chat_id)
+                    outcome = t.classify_outcome()
+                    outcomes[outcome].append(t)
+                except Exception as e:
+                    log.warning(f"[ANALYTICS] Skip classify {t.symbol}: {e}")
+            
+            total = len(all_tokens)
+            success_count = len(outcomes["success"])
+            moderate_count = len(outcomes["moderate"])
+            rugged_count = len(outcomes["rugged"])
+            no_pump_count = len(outcomes["no_pump"])
+            active_count = len(outcomes["active"])
+            
+            # Calculate averages
+            avg_score_success = sum(t.entry_score for t in outcomes["success"]) / len(outcomes["success"]) if outcomes["success"] else 0
+            avg_score_failure = sum(t.entry_score for t in outcomes["no_pump"]) / len(outcomes["no_pump"]) if outcomes["no_pump"] else 0
+            
+            # Build message
+            msg = f"📊 <b>PERFORMANCE ANALYTICS</b>\n\n"
+            msg += f"<b>Total Alerts:</b> {total}\n\n"
+            
+            msg += f"<b>Outcomes:</b>\n"
+            msg += f"✅ Success (≥5X): {success_count} ({success_count/total*100:.1f}%)\n"
+            msg += f"⚠️  Moderate (2-5X): {moderate_count} ({moderate_count/total*100:.1f}%)\n"
+            msg += f"💀 Rugged: {rugged_count} ({rugged_count/total*100:.1f}%)\n"
+            msg += f"📉 No Pump (<2X): {no_pump_count} ({no_pump_count/total*100:.1f}%)\n"
+            msg += f"⏳ Active: {active_count}\n\n"
+            
+            msg += f"<b>Entry Score Analysis:</b>\n"
+            msg += f"Success avg: {avg_score_success:.1f}/10\n"
+            msg += f"Failure avg: {avg_score_failure:.1f}/10\n\n"
+            
+            # Top performers
+            if outcomes["success"]:
+                top_3 = sorted(outcomes["success"], key=lambda t: t.peak_x, reverse=True)[:3]
+                msg += f"<b>🔥 Top Performers:</b>\n"
+                for i, t in enumerate(top_3, 1):
+                    msg += f"{i}. {t.name} - {t.peak_x:.1f}X\n"
+                msg += "\n"
+            
+            # Worst performers
+            if outcomes["rugged"]:
+                msg += f"<b>💀 Rugged ({len(outcomes['rugged'])}):</b>\n"
+                for t in outcomes["rugged"][:3]:
+                    msg += f"- {t.name}\n"
+                msg += "\n"
+            
+            # Success rate and recommendation
+            success_rate = (success_count / total * 100) if total > 0 else 0
+            msg += f"<b>📈 Success Rate: {success_rate:.1f}%</b>\n"
+            
+            if success_rate < 30:
+                msg += "\n⚠️ <i>Consider raising filters</i>"
+            elif success_rate > 50:
+                msg += "\n✅ <i>Great performance!</i>"
+            
+            await send_telegram(msg, chat_id)
+            
+        except Exception as e:
+            log.error(f"[ANALYTICS] Error: {e}")
+            await send_telegram(f"⚠️ Analytics error: {str(e)}", chat_id)
 
     commands = {
         '/status':      lambda cid: send_telegram(format_status(), cid),
