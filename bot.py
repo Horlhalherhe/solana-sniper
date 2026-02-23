@@ -754,9 +754,13 @@ async def handle_commands():
             all_tokens = []
             
             async with tracked_lock:
+                active_count = len(tracked)
                 all_tokens.extend(tracked.values())
+                log.info(f"[ANALYTICS] Collected {active_count} active tokens")
             
             async with history_lock:
+                history_count = len(leaderboard_history)
+                log.info(f"[ANALYTICS] Processing {history_count} history records")
                 for record in leaderboard_history:
                     try:
                         t = TrackedToken(
@@ -775,7 +779,10 @@ async def handle_commands():
                         log.warning(f"[ANALYTICS] Skip record: {e}")
                         continue
             
+            log.info(f"[ANALYTICS] Total tokens collected: {len(all_tokens)}")
+            
             if not all_tokens:
+                log.warning("[ANALYTICS] No tokens found in tracked or history")
                 await send_telegram("📊 No data yet. Wait for some alerts!", chat_id)
                 return
             
