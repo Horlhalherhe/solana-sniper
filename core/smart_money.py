@@ -140,6 +140,26 @@ class WalletProfile:
             self.recent_buys = self.recent_buys[-50:]
         self.last_activity = entry["time"]
     
+    def buys_last_24h(self) -> int:
+        """Count how many tokens this wallet bought in the last 24 hours"""
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        count = 0
+        for buy in self.recent_buys:
+            try:
+                buy_time = datetime.fromisoformat(buy["time"].replace('Z', '+00:00'))
+                if buy_time > cutoff:
+                    count += 1
+            except:
+                pass
+        return count
+    
+    def is_high_volume_bot(self) -> bool:
+        """
+        Detect spray-and-pray bots: wallets that buy 20+ tokens per day.
+        These are NOT smart money — they're speed bots with no edge in selection.
+        """
+        return self.buys_last_24h() > 20
+    
     def to_dict(self):
         return asdict(self)
 
@@ -202,6 +222,10 @@ class SmartMoneyTracker:
         
         for addr, profile in self.wallets.items():
             if not profile.is_active:
+                continue
+            
+            # Skip high-volume bots — not useful signal
+            if profile.is_high_volume_bot():
                 continue
             
             try:
@@ -312,13 +336,20 @@ class SmartMoneyTracker:
         Scan all tracked wallets for recent token purchases.
         Returns list of new buy events.
         
+        Skips high-volume bots (20+ buys/day) — those are noise, not alpha.
         Call this periodically (e.g. every 5 min) to catch new buys.
         """
         new_buys = []
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
+        skipped_bots = 0
         
         for addr, profile in self.wallets.items():
             if not profile.is_active:
+                continue
+            
+            # Skip high-volume bots — they buy everything, not useful as signal
+            if profile.is_high_volume_bot():
+                skipped_bots += 1
                 continue
             
             try:
@@ -348,6 +379,8 @@ class SmartMoneyTracker:
         
         if new_buys:
             print(f"[SmartMoney] Found {len(new_buys)} new buy(s) from tracked wallets")
+        if skipped_bots:
+            print(f"[SmartMoney] Skipped {skipped_bots} high-volume bot wallet(s)")
         
         self._save()
         return new_buys
