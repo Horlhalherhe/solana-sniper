@@ -1,6 +1,10 @@
 """
-NARRATIVE ENGINE
+NARRATIVE ENGINE (PATCHED)
 Detects, categorizes, and scores emerging narratives.
+
+PATCH: Fixed substring matching bug.
+"ai" no longer matches "training", "eth" no longer matches "method", etc.
+Uses regex word boundaries (\b) for all keyword matching.
 """
 
 import re
@@ -72,6 +76,33 @@ VELOCITY_MULTIPLIERS = {
     "rumor": 1.2,
 }
 
+# ── Pre-compile regex patterns for each keyword ──────────────────────────────
+# This is the FIX: use word boundaries so "ai" doesn't match "training"
+_KEYWORD_PATTERNS: dict[str, re.Pattern] = {}
+
+def _build_patterns():
+    """Pre-compile regex patterns with word boundaries for all keywords"""
+    for category, keywords in NARRATIVE_CATEGORIES.items():
+        for kw in keywords:
+            if kw not in _KEYWORD_PATTERNS:
+                # \b = word boundary. Handles: start/end of string, spaces, punctuation
+                # For keywords with special chars, escape them
+                escaped = re.escape(kw)
+                _KEYWORD_PATTERNS[kw] = re.compile(r'\b' + escaped + r'\b', re.IGNORECASE)
+
+_build_patterns()
+
+
+def _keyword_in_text(keyword: str, text: str) -> bool:
+    """Check if keyword exists in text as a whole word (not substring)"""
+    pattern = _KEYWORD_PATTERNS.get(keyword)
+    if pattern:
+        return bool(pattern.search(text))
+    # Fallback for dynamically added keywords
+    escaped = re.escape(keyword)
+    return bool(re.search(r'\b' + escaped + r'\b', text, re.IGNORECASE))
+
+
 @dataclass
 class Narrative:
     keyword: str
@@ -114,7 +145,8 @@ class NarrativeEngine:
                 velocity_mult = max(velocity_mult, mult)
         for category, keywords in NARRATIVE_CATEGORIES.items():
             for kw in keywords:
-                if kw in text_lower:
+                # FIX: word boundary match instead of substring
+                if _keyword_in_text(kw, text_lower):
                     self.keyword_hits[kw] += 1
                     narrative = self._update_or_create(kw, category, velocity_mult)
                     detected.append(narrative)
@@ -160,8 +192,9 @@ class NarrativeEngine:
         kw_lower = keyword.lower()
         if kw_lower in self.active_narratives:
             return self.active_narratives[kw_lower].final_score
+        # FIX: use word boundary match for partial lookups too
         for active_kw, narrative in self.active_narratives.items():
-            if active_kw in kw_lower or kw_lower in active_kw:
+            if _keyword_in_text(active_kw, kw_lower) or _keyword_in_text(kw_lower, active_kw):
                 return narrative.final_score * 0.7
         return None
 
@@ -176,8 +209,10 @@ class NarrativeEngine:
         best_confidence = 0.0
         
         for kw, narrative in self.active_narratives.items():
-            if kw in combined:
-                confidence = 0.95 if (kw in name.lower() or kw in symbol.lower()) else 0.65
+            # FIX: word boundary match instead of substring
+            if _keyword_in_text(kw, combined):
+                # Higher confidence if keyword matches name or symbol directly
+                confidence = 0.95 if (_keyword_in_text(kw, name.lower()) or _keyword_in_text(kw, symbol.lower())) else 0.65
                 weighted = narrative.final_score * confidence
                 if weighted > best_score:
                     best_score = weighted
@@ -217,6 +252,12 @@ class NarrativeEngine:
         now = datetime.utcnow()
         kw_lower = keyword.lower()
         self.keyword_hits[kw_lower] = max(int(score * 2), 1)
+        
+        # Also build a pattern for the new keyword
+        if kw_lower not in _KEYWORD_PATTERNS:
+            escaped = re.escape(kw_lower)
+            _KEYWORD_PATTERNS[kw_lower] = re.compile(r'\b' + escaped + r'\b', re.IGNORECASE)
+        
         n = Narrative(
             keyword=kw_lower,
             category=category,
