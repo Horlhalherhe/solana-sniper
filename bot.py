@@ -1,16 +1,19 @@
 """
-SOLANA_NARRATIVE_SNIPER — BOT LOOP [v2.4]
+SOLANA_NARRATIVE_SNIPER — BOT LOOP [v3.0]
 Pump.fun -> score -> Telegram alerts
++ Smart money tracking & copy-trade detection
++ Honeypot simulation + wallet cluster detection
++ Adaptive scoring via backtesting
 + Post-alert tracker: X multipliers + migration
 + PnL Leaderboard: 24h, weekly, monthly
-+ Telegram commands: /status /leaderboard /weekly /monthly /narratives /tracking /help
++ Outcome recording for weight optimization
 
-FIXES v2.4:
-- DexScreener added as fallback when Birdeye returns 400
-- DexScreener indexes pump.fun tokens within ~30s of launch (free, no key needed)
-- Tokens skipped cleanly if both Birdeye AND DexScreener unavailable
-- WS reconnect max 30s
-- No crashes on Helius-only data
+v3.0 UPGRADES:
+- Smart money wallet tracking (check_token, scan_recent_activity, discover)
+- Rug analyzer v2: on-chain fetching, honeypot sim, wallet clusters, bundles
+- Entry scorer v2: 8 components (added smart_money, rug_safety, bundles)
+- Backtester: records signals + outcomes, evolutionary weight optimization
+- New commands: /smartmoney /optimize /performance /outcome
 """
 
 import asyncio
@@ -29,6 +32,17 @@ import websockets
 
 sys.path.insert(0, str(Path(__file__).parent))
 from sniper import SolanaNarrativeSniper
+
+# ── v2 Modules (graceful — bot runs v1 if these fail) ─────────────────────────
+try:
+    from core.smart_money import SmartMoneyTracker
+    from core.rug_analyzer_v2 import RugAnalyzerV2
+    from core.entry_scorer_v2 import EntryScorerV2, EntryInputV2
+    from core.backtester import SignalHistory, WeightOptimizer, AdaptiveEntryScorer
+    V2_AVAILABLE = True
+except ImportError as e:
+    print(f"[WARN] v2 modules not available ({e}) — running v1 mode")
+    V2_AVAILABLE = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -143,6 +157,13 @@ leaderboard_history: List[dict] = []
 sniper_ref: Optional[SolanaNarrativeSniper] = None
 bot_start_time: datetime = utcnow()
 total_alerts_fired: int = 0
+
+# ─── v2 Global State ──────────────────────────────────────────────────────────
+smart_money_tracker: Optional[SmartMoneyTracker] = None
+rug_analyzer_v2: Optional[RugAnalyzerV2] = None
+scorer_v2: Optional[EntryScorerV2] = None
+signal_history: Optional[SignalHistory] = None
+weight_optimizer: Optional[WeightOptimizer] = None
 
 # ─── Persistence ───────────────────────────────────────────────────────────────
 async def save_leaderboard_async():
@@ -385,6 +406,125 @@ def format_x_alert(token: TrackedToken, current_mcap: float, multiplier: int) ->
         f"<i>🕐 {utcnow().strftime('%H:%M:%S UTC')}</i>",
     ])
 
+# ─── v2 Alert Formatter ───────────────────────────────────────────────────────
+def format_alert_v2(alert, v2_score, smart_signal, rug_v2, token_data, narrative_match) -> str:
+    """Upgraded alert format with smart money, honeypot, and v2 scoring"""
+    e = alert.entry
+    r = alert.rug
+    t = alert.token
+    n = narrative_match
+    mint = token_data.get("mint", "")
+    name = token_data.get("name", "?")
+    symbol = token_data.get("symbol", "?")
+
+    # Use v2 score if available, else v1
+    if v2_score:
+        final_score = v2_score["final_score"]
+        verdict = v2_score["verdict"]
+        weight_src = v2_score.get("weights_source", "static")
+    else:
+        final_score = e.get("final_score", 0)
+        verdict = e.get("verdict", "")
+        weight_src = "v1"
+
+    rug_score = rug_v2.rug_score if rug_v2 else r.get("rug_score", 10)
+    rug_verdict = rug_v2.verdict if rug_v2 else r.get("verdict", "")
+
+    # Score bar
+    filled = int(final_score)
+    bar = "█" * filled + "░" * (10 - filled)
+
+    lines = [
+        "🎯 <b>SNIPER ALERT</b> [v3]", "",
+        f"<b>{name}</b>  <code>${symbol}</code>",
+        f"<code>{mint}</code>", "",
+        f"📊 <b>SCORE: {final_score}/10</b>  {verdict}",
+        f"{bar}",
+        f"🔒 <b>RUG:   {rug_score}/10</b>  {rug_verdict}",
+        f"<i>weights: {weight_src}</i>", "",
+    ]
+
+    # Smart money section (most important new info)
+    if smart_signal and smart_signal.wallets_in:
+        lines.append(f"💰 <b>SMART MONEY</b>")
+        lines.append(f"├ {len(smart_signal.wallets_in)} wallet(s) in ({smart_signal.total_smart_money_sol:.1f} SOL)")
+        lines.append(f"├ Signal: {smart_signal.signal_strength:.1f}/10")
+        if smart_signal.is_consensus:
+            lines.append(f"└ 🔥 <b>CONSENSUS (3+ wallets)</b>")
+        else:
+            lines.append(f"└ Confidence: {smart_signal.avg_confidence:.0%}")
+        # Show wallet tags
+        for w in smart_signal.wallets_in[:3]:
+            lines.append(f"   • {w.get('tag', w['address'][:8])} (WR: {w.get('win_rate', 0):.0%})")
+        lines.append("")
+
+    # Token info
+    lines += [
+        f"📡 Narrative:  <b>{((n.get('narrative') or {}).get('keyword', 'NONE')).upper()}</b>",
+        f"💰 MCap:       <b>${token_data.get('mcap_usd', 0):,.0f}</b>",
+        f"💧 Liquidity:  <b>${token_data.get('liquidity_usd', 0):,.0f}</b>",
+        f"👥 Holders:    <b>{token_data.get('total_holders', 0)}</b>",
+        f"📈 Vol 1h:     <b>${token_data.get('volume_1h_usd', 0):,.0f}</b>",
+    ]
+
+    # Honeypot status (critical safety info)
+    if rug_v2 and rug_v2.honeypot_data:
+        hp = rug_v2.honeypot_data
+        if hp.can_sell and hp.sell_tax_pct < 15:
+            lines.append(f"✅ Can sell (tax: {hp.sell_tax_pct:.0f}%)")
+        elif hp.is_suspicious:
+            lines.append(f"⚠️ Suspicious sell tax: {hp.sell_tax_pct:.0f}%")
+
+    # Bundles
+    if rug_v2 and rug_v2.bundle_data and rug_v2.bundle_data.sniper_estimate > 0:
+        lines.append(f"🤖 Snipers: {rug_v2.bundle_data.sniper_estimate}")
+
+    # Wallet clusters
+    if rug_v2 and rug_v2.holder_data and rug_v2.holder_data.wallet_clusters_detected > 0:
+        lines.append(f"🕸️ Clusters: {rug_v2.holder_data.wallet_clusters_detected}")
+
+    lines.append("")
+
+    # v2 Score breakdown
+    if v2_score and v2_score.get("breakdown"):
+        lines.append("<b>Score Breakdown</b>")
+        for comp, data in v2_score["breakdown"].items():
+            if isinstance(data, dict):
+                raw = data.get("raw", 0)
+                mini = "▓" * int(raw) + "░" * (10 - int(raw))
+                lines.append(f"  {comp[:8]:8s} {raw:4.1f} {mini}")
+        lines.append("")
+
+    # Signals & warnings from v2
+    if v2_score and v2_score.get("signals"):
+        for s in v2_score["signals"][:4]:
+            lines.append(f"✅ {s}")
+    if v2_score and v2_score.get("warnings"):
+        for w in v2_score["warnings"][:4]:
+            lines.append(f"⚠️ {w}")
+
+    lines += [
+        "",
+        f"🔗 <a href='https://pump.fun/{mint}'>pump.fun</a>  "
+        f"<a href='https://dexscreener.com/solana/{mint}'>dexscreener</a>  "
+        f"<a href='https://gmgn.ai/sol/token/{mint}'>gmgn</a>  "
+        f"<a href='https://solscan.io/token/{mint}'>solscan</a>",
+        f"<i>🕐 {utcnow().strftime('%H:%M:%S UTC')}</i>",
+    ]
+    return "\n".join(lines)
+    emoji = "🚀" if multiplier < 10 else "🌕" if multiplier < 50 else "💎"
+    return "\n".join([
+        f"{emoji} <b>{multiplier}X ALERT</b>", "",
+        f"<b>{token.name}</b>  <code>${token.symbol}</code>",
+        f"<code>{token.mint}</code>", "",
+        f"Entry MCap:   <b>${token.entry_mcap:,.0f}</b>",
+        f"Current MCap: <b>${current_mcap:,.0f}</b>",
+        f"Multiplier:   <b>{multiplier}X 🔥</b>", "",
+        f"🔗 <a href='https://dexscreener.com/solana/{token.mint}'>dexscreener</a>  "
+        f"<a href='https://pump.fun/{token.mint}'>pump.fun</a>",
+        f"<i>🕐 {utcnow().strftime('%H:%M:%S UTC')}</i>",
+    ])
+
 def format_migration_alert(token: TrackedToken, current_mcap: float) -> str:
     verified = "✅ Verified" if token.migration_verified else "⚠️ Unverified"
     return "\n".join([
@@ -445,14 +585,24 @@ def format_status() -> str:
     narratives = len(sniper_ref.narrative_engine.active_narratives) if sniper_ref else 0
     peak_xs    = [t.peak_x for t in tracked.values()]
     best_live  = f"{max(peak_xs):.1f}X" if peak_xs else "none"
+    
+    sm_count = smart_money_tracker.get_wallet_count() if smart_money_tracker else 0
+    sig_count = len(signal_history.records) if signal_history else 0
+    completed = len(signal_history.get_completed_records()) if signal_history else 0
+    w_src = "adaptive" if weight_optimizer and Path(os.getenv("SNIPER_DATA_DIR", "./data"), "optimized_weights.json").exists() else "static"
+    
     return "\n".join([
-        "⚡ <b>BOT STATUS</b>", "",
+        "⚡ <b>BOT STATUS</b> [v3.0]", "",
         f"🟢 Online:        <b>{hours}h {mins}m</b>",
         f"🎯 Alerts fired:  <b>{total_alerts_fired}</b>",
         f"👁 Tracking now:  <b>{active} tokens</b>",
         f"📊 Total tracked: <b>{total}</b>",
         f"🏆 Best live:     <b>{best_live}</b>",
-        f"📡 Narratives:    <b>{narratives} active</b>",
+        f"📡 Narratives:    <b>{narratives} active</b>", "",
+        "<b>── v2 Intelligence ──</b>",
+        f"💰 Smart Money:   <b>{sm_count} wallets</b>",
+        f"📝 Signals:       <b>{sig_count} recorded ({completed} with outcomes)</b>",
+        f"⚙️ Weights:       <b>{w_src}</b>", "",
         f"🎚 Threshold:     <b>{ALERT_THRESHOLD}/10</b>",
         f"💧 Min LP:        <b>${MIN_LIQUIDITY:,.0f}</b>", "",
         f"<i>🕐 {utcnow().strftime('%H:%M:%S UTC')}</i>",
@@ -488,14 +638,20 @@ def format_tracking() -> str:
 def format_help() -> str:
     return "\n".join([
         "🤖 <b>SNIPER COMMANDS</b>", "",
+        "<b>── Info ──</b>",
         "/status          — bot health + live stats",
+        "/tracking        — tokens being tracked now",
+        "/narratives      — active narrative list",
+        "/help            — this menu", "",
+        "<b>── Leaderboards ──</b>",
         "/leaderboard     — 24h leaderboard",
         "/weekly          — 7 day leaderboard",
         "/monthly         — 30 day leaderboard",
-        "/narratives      — active narrative list",
-        "/tracking        — tokens being tracked now",
-        "/analytics       — performance stats",
-        "/help            — this menu",
+        "/analytics       — performance stats", "",
+        "<b>── v2 Intelligence ──</b>",
+        "/smartmoney      — tracked wallets + top performers",
+        "/performance     — signal correlations + weight analysis",
+        "/optimize        — run weight optimization (needs 20+ outcomes)",
     ])
 
 # ─── MCap Fetcher (tracker) ────────────────────────────────────────────────────
@@ -668,6 +824,33 @@ async def track_tokens():
         async with semaphore:
             try:
                 if (utcnow() - token.added_at).total_seconds() / 3600 > 24:
+                    # ── Record outcome for backtesting before archiving ──
+                    if signal_history:
+                        try:
+                            outcome = token.classify_outcome()
+                            backtest_outcome = {
+                                "success": "winner", "moderate": "winner",
+                                "rugged": "rug", "no_pump": "loser",
+                            }.get(outcome, "unknown")
+                            signal_history.update_outcome(
+                                mint, backtest_outcome,
+                                peak_x=token.peak_x,
+                                final_x=token.current_x(),
+                                peak_mcap=token.peak_mcap,
+                            )
+                            log.info(f"  [BACKTEST] Recorded {token.symbol}: {backtest_outcome} (peak {token.peak_x:.1f}X)")
+                            
+                            # Discover smart money from winners
+                            if backtest_outcome == "winner" and token.peak_x >= 3.0 and smart_money_tracker:
+                                async with httpx.AsyncClient(timeout=15) as session:
+                                    discovered = await smart_money_tracker.discover_from_token(
+                                        session, mint, "winner", token.peak_x
+                                    )
+                                    if discovered:
+                                        log.info(f"  [SMART$] Discovered {len(discovered)} wallet(s) from {token.symbol}")
+                        except Exception as e:
+                            log.warning(f"  [BACKTEST] Record error: {e}")
+                    
                     async with tracked_lock, history_lock:
                         if mint in tracked:
                             leaderboard_history.append(tracked[mint].to_record())
@@ -863,6 +1046,99 @@ async def handle_commands():
             log.error(f"[ANALYTICS] Error: {e}")
             await send_telegram(f"⚠️ Analytics error: {str(e)}", chat_id)
 
+    # ── v2 Command Handlers ──────────────────────────────────────────────────
+    async def send_smart_money_status(chat_id: str):
+        """Show smart money tracker status"""
+        if not smart_money_tracker:
+            await send_telegram("💰 Smart money tracker not initialized", chat_id)
+            return
+        
+        wallet_count = smart_money_tracker.get_wallet_count()
+        top = smart_money_tracker.get_top_wallets(5)
+        
+        lines = [f"💰 <b>SMART MONEY TRACKER</b>", "",
+                 f"Wallets tracked: <b>{wallet_count}</b>", ""]
+        
+        if top:
+            lines.append("<b>Top Wallets by Confidence:</b>")
+            for i, w in enumerate(top, 1):
+                tag = w.get("tag", w["address"][:8])
+                conf = w.get("confidence_score", 0)
+                wr = w.get("win_rate", 0)
+                trades = w.get("total_trades", 0)
+                lines.append(f"{i}. <b>{tag}</b>")
+                lines.append(f"   WR: {wr:.0%} | Trades: {trades} | Conf: {conf:.2f}")
+        else:
+            lines.append("<i>No wallets added yet.</i>")
+            lines.append("Add wallets from GMGN.ai or Birdeye leaderboards.")
+        
+        await send_telegram("\n".join(lines), chat_id)
+    
+    async def send_performance(chat_id: str):
+        """Show signal performance analysis"""
+        if not signal_history:
+            await send_telegram("📊 Signal history not initialized", chat_id)
+            return
+        
+        stats = signal_history.get_stats()
+        correlations = signal_history.get_component_correlations()
+        
+        lines = [f"📊 <b>SIGNAL PERFORMANCE</b>", ""]
+        
+        if stats.get("total_signals", 0) == 0:
+            lines.append("No signals recorded yet.")
+            await send_telegram("\n".join(lines), chat_id)
+            return
+        
+        lines += [
+            f"Total signals: <b>{stats.get('total_signals', 0)}</b>",
+            f"Completed: <b>{stats.get('completed', 0)}</b>",
+            f"Win rate: <b>{stats.get('win_rate', 0):.1%}</b>",
+            f"Alerted win rate: <b>{stats.get('alerted_win_rate', 0):.1%}</b>", "",
+            f"Winners: {stats.get('winners', 0)} | Losers: {stats.get('losers', 0)} | Rugs: {stats.get('rugs', 0)}",
+            f"Best trade: <b>{stats.get('best_trade_x', 0):.1f}X</b>",
+            f"Avg peak (winners): <b>{stats.get('avg_peak_x_winners', 0):.1f}X</b>", "",
+        ]
+        
+        if isinstance(correlations, dict) and "message" not in correlations:
+            lines.append("<b>Signal Predictive Power:</b>")
+            for comp, data in list(correlations.items())[:6]:
+                power = data.get("predictive_power", "?")
+                sep = data.get("separation", 0)
+                emoji = {"strong": "🟢", "moderate": "🟡", "weak": "🟠", "negative": "🔴"}.get(power, "⚪")
+                lines.append(f"  {emoji} {comp}: {power} (sep: {sep:+.1f})")
+        
+        if weight_optimizer:
+            weights = weight_optimizer.get_weights()
+            lines += ["", "<b>Current Weights:</b>"]
+            sorted_w = sorted(weights.items(), key=lambda x: x[1], reverse=True)
+            for k, v in sorted_w:
+                lines.append(f"  {k}: {v*100:.1f}%")
+        
+        await send_telegram("\n".join(lines), chat_id)
+    
+    async def run_optimization(chat_id: str):
+        """Run weight optimization"""
+        if not weight_optimizer:
+            await send_telegram("⚙️ Optimizer not initialized", chat_id)
+            return
+        
+        await send_telegram("⚙️ Running weight optimization...", chat_id)
+        result = weight_optimizer.optimize()
+        
+        if result.get("success"):
+            lines = [
+                "✅ <b>OPTIMIZATION COMPLETE</b>", "",
+                f"Improvement: <b>{result['improvement_pct']:+.1f}%</b>",
+                f"Records used: {result['records_used']}", "",
+                "<b>New Weights:</b>",
+            ]
+            for comp in result.get("components_ranked", []):
+                lines.append(f"  {comp['component']}: {comp['pct']}")
+            await send_telegram("\n".join(lines), chat_id)
+        else:
+            await send_telegram(f"⚠️ {result.get('message', 'Optimization failed')}", chat_id)
+
     commands = {
         '/status':      lambda cid: send_telegram(format_status(), cid),
         '/leaderboard': lambda cid: _send_leaderboard(cid, 1),
@@ -871,6 +1147,9 @@ async def handle_commands():
         '/narratives':  lambda cid: send_telegram(format_narratives(), cid),
         '/tracking':    lambda cid: send_telegram(format_tracking(), cid),
         '/analytics':   lambda cid: send_analytics(cid),
+        '/smartmoney':  lambda cid: send_smart_money_status(cid),
+        '/performance': lambda cid: send_performance(cid),
+        '/optimize':    lambda cid: run_optimization(cid),
         '/help':        lambda cid: send_telegram(format_help(), cid),
     }
 
@@ -911,11 +1190,30 @@ async def handle_commands():
 # ─── Main Bot Loop ─────────────────────────────────────────────────────────────
 async def run_bot():
     global sniper_ref, total_alerts_fired, bot_start_time
+    global smart_money_tracker, rug_analyzer_v2, scorer_v2, signal_history, weight_optimizer
     bot_start_time = utcnow()
     load_leaderboard()
 
     sniper     = SolanaNarrativeSniper()
     sniper_ref = sniper
+
+    # ── Initialize v2 Modules ─────────────────────────────────────────────────
+    if V2_AVAILABLE:
+        try:
+            signal_history = SignalHistory()
+            weight_optimizer = WeightOptimizer(signal_history)
+            adaptive_scorer = AdaptiveEntryScorer(weight_optimizer)
+            scorer_v2 = EntryScorerV2(adaptive_scorer=adaptive_scorer)
+            smart_money_tracker = SmartMoneyTracker()
+            rug_analyzer_v2 = RugAnalyzerV2()
+            
+            sm_count = smart_money_tracker.get_wallet_count()
+            sig_count = len(signal_history.records)
+            log.info(f"[v2] Modules initialized — Smart money: {sm_count} wallets, History: {sig_count} signals")
+        except Exception as e:
+            log.error(f"[v2] Init error (running with v1 fallback): {e}")
+    else:
+        log.info("[v2] Modules not available — running v1 only")
 
     seed = os.getenv("SEED_NARRATIVES", "")
     if seed:
@@ -927,12 +1225,14 @@ async def run_bot():
                 except ValueError:
                     log.warning(f"[SEED] Invalid score for {parts[0]}")
 
+    sm_status = f"{smart_money_tracker.get_wallet_count()} wallets" if smart_money_tracker else "off"
+    
     log.info("=" * 50)
-    log.info("  TekkiSniPer — BOT ONLINE [v2.4]")
+    log.info("  TekkiSniPer — BOT ONLINE [v3.0]")
     log.info(f"  Threshold: {ALERT_THRESHOLD}  MinLP: ${MIN_LIQUIDITY:,.0f}  MaxMCap: ${MAX_ENTRY_MCAP:,.0f}")
     log.info(f"  Data: Birdeye -> DexScreener fallback")
-    log.info(f"  Holder filters: top1 < 10%  top10 < 40%")
-    log.info(f"  WS reconnect max: 30s")
+    log.info(f"  Smart Money: {sm_status}")
+    log.info(f"  Scoring: {'adaptive' if weight_optimizer else 'static'} weights")
     log.info(f"  Telegram: {'on' if TELEGRAM_BOT_TOKEN else 'off'} ({len(CHAT_IDS)} channel{'s' if len(CHAT_IDS) != 1 else ''})")
     log.info(f"  Helius: {'on' if HELIUS_API_KEY else 'off'}  Birdeye: {'on' if BIRDEYE_API_KEY else 'off'}")
     log.info("=" * 50)
@@ -942,10 +1242,12 @@ async def run_bot():
         await asyncio.sleep(2)
 
     await send_telegram(
-        "🎯 <b>TekkiSniPer ONLINE</b> [v2.4]\n"
+        "🎯 <b>TekkiSniPer ONLINE</b> [v3.0]\n"
         f"Threshold: {ALERT_THRESHOLD}/10  |  Min LP: ${MIN_LIQUIDITY:,.0f}  |  Max MCap: ${MAX_ENTRY_MCAP:,.0f}\n"
-        f"Data: Birdeye → DexScreener fallback\n"
-        f"Commands: /status /leaderboard /narratives /tracking /help\n"
+        f"💰 Smart Money: {sm_status}\n"
+        f"📊 Scoring: {'adaptive' if weight_optimizer else 'static'} weights\n"
+        f"🛡️ Rug v2: honeypot sim + clusters + bundles\n"
+        f"Commands: /help for full list\n"
         f"<i>Watching Pump.fun live...</i>"
     )
 
@@ -954,6 +1256,7 @@ async def run_bot():
         asyncio.create_task(track_tokens()),
         asyncio.create_task(leaderboard_scheduler()),
         asyncio.create_task(handle_commands()),
+        asyncio.create_task(_smart_money_scanner()),
     ]
     try:
         await asyncio.gather(*tasks)
@@ -963,6 +1266,45 @@ async def run_bot():
         await asyncio.gather(*tasks, return_exceptions=True)
     except Exception as e:
         log.critical(f"[BOT] Fatal: {e}"); raise
+
+async def _smart_money_scanner():
+    """Periodically scan tracked wallets for new buys"""
+    await asyncio.sleep(60)  # Wait for startup
+    while True:
+        try:
+            if smart_money_tracker and smart_money_tracker.get_wallet_count() > 0:
+                async with httpx.AsyncClient(timeout=15) as session:
+                    new_buys = await smart_money_tracker.scan_recent_activity(
+                        session, lookback_minutes=15
+                    )
+                    if new_buys:
+                        # Group by token
+                        from collections import defaultdict
+                        by_token = defaultdict(list)
+                        for buy in new_buys:
+                            by_token[buy["mint"]].append(buy)
+                        
+                        for mint, buys in by_token.items():
+                            if len(buys) >= 2:  # 2+ wallets buying same token
+                                tags = ", ".join(b.get("tag", b["wallet"][:8]) for b in buys[:3])
+                                total_sol = sum(b.get("sol_amount", 0) for b in buys)
+                                await send_telegram(
+                                    f"💰 <b>SMART MONEY ALERT</b>\n\n"
+                                    f"{len(buys)} tracked wallets buying:\n"
+                                    f"<code>{mint}</code>\n"
+                                    f"Wallets: {tags}\n"
+                                    f"Total: {total_sol:.2f} SOL\n\n"
+                                    f"🔗 <a href='https://dexscreener.com/solana/{mint}'>chart</a> · "
+                                    f"<a href='https://gmgn.ai/sol/token/{mint}'>gmgn</a>"
+                                )
+                
+                # Decay inactive wallets weekly
+                smart_money_tracker.decay_inactive(days_threshold=14)
+                
+        except Exception as e:
+            log.warning(f"[SmartMoney Scanner] Error: {e}")
+        
+        await asyncio.sleep(300)  # Scan every 5 minutes
 
 async def _bot_loop(sniper):
     retry_delay = 5
@@ -1071,34 +1413,161 @@ async def handle_token(sniper, msg: dict):
             log.info(f"  -> Dev holds {token_data['dev_holds_pct']:.1f}% > 5% — skip")
             return
 
+    # ── v1 analysis (narrative + entry + rug) ─────────────────────────────────
     alert       = sniper.analyze_token(token_data)
     entry_score = alert.entry.get("final_score", 0)
     rug_score   = alert.rug.get("rug_score", 10)
     flags       = alert.rug.get("flags", [])
-    log.info(f"  -> Entry: {entry_score}/10  Rug: {rug_score}/10  {alert.entry.get('verdict','')}")
+    log.info(f"  -> v1 Entry: {entry_score}/10  Rug: {rug_score}/10  {alert.entry.get('verdict','')}")
+
+    # ── v2: Smart Money Check ─────────────────────────────────────────────────
+    smart_signal = None
+    if smart_money_tracker:
+        try:
+            async with httpx.AsyncClient(timeout=15) as session:
+                smart_signal = await smart_money_tracker.check_token(session, mint)
+                if smart_signal and smart_signal.wallets_in:
+                    log.info(f"  -> 💰 Smart Money: {len(smart_signal.wallets_in)} wallet(s), "
+                             f"signal={smart_signal.signal_strength:.1f}/10")
+        except Exception as e:
+            log.warning(f"  -> Smart money check error: {e}")
+
+    # ── v2: Rug Analysis (on-chain + honeypot + clusters + bundles) ───────────
+    rug_v2_report = None
+    if rug_analyzer_v2:
+        try:
+            async with httpx.AsyncClient(timeout=20) as session:
+                rug_v2_report = await rug_analyzer_v2.analyze(
+                    session, mint, deployer=deployer, name=name, symbol=symbol
+                )
+                log.info(f"  -> v2 Rug: {rug_v2_report.rug_score}/10 — {rug_v2_report.verdict}")
+                if rug_v2_report.honeypot_data and rug_v2_report.honeypot_data.is_honeypot:
+                    log.info(f"  -> 🍯 HONEYPOT DETECTED — skip")
+                    return
+        except Exception as e:
+            log.warning(f"  -> Rug v2 error (using v1 fallback): {e}")
+
+    # ── v2: Adaptive Scoring ──────────────────────────────────────────────────
+    v2_score_result = None
+    v2_entry_score = entry_score  # Fallback to v1 score
+
+    if scorer_v2:
+        try:
+            # Build v2 input from all available data
+            v2_input = EntryInputV2(
+                # Narrative
+                narrative_score=quick.get("narrative_score", 0),
+                narrative_confidence=quick.get("confidence", 0),
+                # Timing
+                launch_age_hours=token_data.get("age_hours", 0.5),
+                market_conditions=token_data.get("market_conditions", "neutral"),
+                # Holders
+                total_holders=token_data.get("total_holders", 0),
+                top1_pct=token_data.get("top1_pct", 5),
+                top10_pct=token_data.get("top10_pct", 25),
+                dev_holds_pct=token_data.get("dev_holds_pct", 0),
+                wallet_clusters=rug_v2_report.holder_data.wallet_clusters_detected if rug_v2_report and rug_v2_report.holder_data else 0,
+                holder_growth_1h=token_data.get("holder_growth_1h", 0),
+                # Deployer
+                rug_score=rug_v2_report.rug_score if rug_v2_report else rug_score,
+                deployer_age_days=rug_v2_report.deployer_data.age_days if rug_v2_report and rug_v2_report.deployer_data else token_data.get("deployer_age_days", 30),
+                deployer_prev_rugs=len(rug_v2_report.deployer_data.rugged_tokens) if rug_v2_report and rug_v2_report.deployer_data else 0,
+                deployer_is_serial=rug_v2_report.deployer_data.tokens_last_30d > 10 if rug_v2_report and rug_v2_report.deployer_data else False,
+                # Momentum
+                volume_1h_usd=token_data.get("volume_1h_usd", 0),
+                price_change_1h_pct=token_data.get("price_change_1h_pct", 0),
+                buy_sell_ratio_1h=token_data.get("buy_sell_ratio_1h", 1.0),
+                lp_usd=token_data.get("liquidity_usd", 0),
+                # Smart Money (NEW)
+                smart_money_wallets_in=len(smart_signal.wallets_in) if smart_signal else 0,
+                smart_money_signal_strength=smart_signal.signal_strength if smart_signal else 0,
+                smart_money_avg_confidence=smart_signal.avg_confidence if smart_signal else 0,
+                smart_money_total_sol=smart_signal.total_smart_money_sol if smart_signal else 0,
+                smart_money_is_consensus=smart_signal.is_consensus if smart_signal else False,
+                # Honeypot (NEW)
+                is_honeypot=rug_v2_report.honeypot_data.is_honeypot if rug_v2_report and rug_v2_report.honeypot_data else False,
+                honeypot_sell_tax_pct=rug_v2_report.honeypot_data.sell_tax_pct if rug_v2_report and rug_v2_report.honeypot_data else 0,
+                is_honeypot_suspicious=rug_v2_report.honeypot_data.is_suspicious if rug_v2_report and rug_v2_report.honeypot_data else False,
+                mint_authority_revoked=token_data.get("mint_authority_revoked", True),
+                freeze_authority_revoked=token_data.get("freeze_authority_revoked", True),
+                lp_burned=token_data.get("lp_burned", False),
+                lp_locked=token_data.get("lp_locked", False),
+                # Bundles (NEW)
+                sniper_count=rug_v2_report.bundle_data.sniper_estimate if rug_v2_report and rug_v2_report.bundle_data else 0,
+                is_heavily_bundled=rug_v2_report.bundle_data.is_heavily_bundled if rug_v2_report and rug_v2_report.bundle_data else False,
+            )
+
+            v2_score_result = scorer_v2.score(v2_input)
+            v2_entry_score = v2_score_result["final_score"]
+            log.info(f"  -> v2 Score: {v2_entry_score}/10 — {v2_score_result['verdict']} "
+                     f"({v2_score_result.get('weights_source', 'static')} weights)")
+        except Exception as e:
+            log.warning(f"  -> v2 scoring error (using v1 fallback): {e}")
+            v2_entry_score = entry_score
+
+    # ── Use the HIGHER of v1 and v2 flags for safety ──────────────────────────
+    effective_rug_score = rug_v2_report.rug_score if rug_v2_report else rug_score
     
-    # Critical: Flags must be NONE (no red flags allowed)
+    # Critical: Skip if v2 rug flags are severe
+    v2_flags = rug_v2_report.flags if rug_v2_report else []
+    critical_v2_flags = [f for f in v2_flags if hasattr(f, 'severity') and f.severity == "critical"]
+    
+    # Use v1 flag check as before, plus v2 critical flags
     if flags and len(flags) > 0:
         flag_codes = [f['code'] for f in flags[:3]]
-        log.info(f"  -> Flags detected {flag_codes} — skip")
+        log.info(f"  -> v1 Flags {flag_codes} — skip")
+        return
+    
+    if critical_v2_flags:
+        flag_codes = [f.code for f in critical_v2_flags[:3]]
+        log.info(f"  -> v2 Critical flags {flag_codes} — skip")
         return
 
-    if entry_score >= ALERT_THRESHOLD:
+    # ── Decision: use v2 score if available, else v1 ──────────────────────────
+    final_score = v2_entry_score
+
+    if final_score >= ALERT_THRESHOLD:
         async with alerts_lock:
             total_alerts_fired += 1
-        log.info(f"  🎯 FIRING — {name} (${symbol})  [{source}]")
-        await send_telegram(format_alert(alert))
+        log.info(f"  🎯 FIRING — {name} (${symbol})  [{source}]  v2={v2_entry_score:.1f}")
         
+        # Send upgraded alert with v2 data
+        alert_msg = format_alert_v2(alert, v2_score_result, smart_signal, rug_v2_report, token_data, quick)
+        await send_telegram(alert_msg)
+        
+        # Track token
         entry_mcap = token_data.get("mcap_usd", 0)
         if entry_mcap > 0:
             nar_kw = (quick.get("narrative") or {}).get("keyword", "unknown")
             async with tracked_lock:
                 tracked[mint] = TrackedToken(
                     mint=mint, name=name, symbol=symbol,
-                    entry_mcap=entry_mcap, entry_score=entry_score,
+                    entry_mcap=entry_mcap, entry_score=final_score,
                     narrative=nar_kw,
                 )
             asyncio.create_task(save_leaderboard_async())
+        
+        # ── Record signal for backtesting ─────────────────────────────────
+        if signal_history and v2_score_result:
+            try:
+                components = v2_score_result.get("components", {})
+                signal_history.record_signal(
+                    mint=mint, name=name, symbol=symbol,
+                    narrative_score=components.get("narrative", 5),
+                    timing_score=components.get("timing", 5),
+                    holders_score=components.get("holders", 5),
+                    deployer_score=components.get("deployer", 5),
+                    momentum_score=components.get("momentum", 5),
+                    smart_money_score=components.get("smart_money", 0),
+                    rug_safety_score=components.get("rug_safety", 5),
+                    bundles_score=components.get("bundles", 5),
+                    entry_score=final_score,
+                    alert_sent=True,
+                    source=source,
+                    narrative_category=(quick.get("narrative") or {}).get("category", ""),
+                )
+            except Exception as e:
+                log.warning(f"  -> Signal recording error: {e}")
 
 if __name__ == "__main__":
     try:
