@@ -1268,7 +1268,7 @@ async def run_bot():
         log.critical(f"[BOT] Fatal: {e}"); raise
 
 async def _smart_money_scanner():
-    """Periodically scan tracked wallets for new buys"""
+    """Periodically scan tracked wallets for new buys — only alert on quality signals"""
     await asyncio.sleep(60)  # Wait for startup
     while True:
         try:
@@ -1285,18 +1285,34 @@ async def _smart_money_scanner():
                             by_token[buy["mint"]].append(buy)
                         
                         for mint, buys in by_token.items():
-                            if len(buys) >= 2:  # 2+ wallets buying same token
-                                tags = ", ".join(b.get("tag", b["wallet"][:8]) for b in buys[:3])
-                                total_sol = sum(b.get("sol_amount", 0) for b in buys)
-                                await send_telegram(
-                                    f"💰 <b>SMART MONEY ALERT</b>\n\n"
-                                    f"{len(buys)} tracked wallets buying:\n"
-                                    f"<code>{mint}</code>\n"
-                                    f"Wallets: {tags}\n"
-                                    f"Total: {total_sol:.2f} SOL\n\n"
-                                    f"🔗 <a href='https://dexscreener.com/solana/{mint}'>chart</a> · "
-                                    f"<a href='https://gmgn.ai/sol/token/{mint}'>gmgn</a>"
-                                )
+                            # Require 3+ UNIQUE wallets (not 2) — reduces noise
+                            unique_wallets = {b["wallet"] for b in buys}
+                            if len(unique_wallets) < 3:
+                                continue
+                            
+                            # Quick LP check — skip if token has no liquidity
+                            try:
+                                dex = await fetch_dexscreener(mint)
+                                liq = dex.get("liquidity_usd", 0)
+                                mcap = dex.get("mcap_usd", 0)
+                                if liq < MIN_LIQUIDITY:
+                                    log.info(f"[SmartMoney] {mint[:12]} — {len(unique_wallets)} wallets but LP ${liq:,.0f} < min — skip")
+                                    continue
+                            except Exception:
+                                continue  # Can't verify = skip
+                            
+                            tags = ", ".join(b.get("tag", b["wallet"][:8]) for b in buys[:3])
+                            total_sol = sum(b.get("sol_amount", 0) for b in buys)
+                            await send_telegram(
+                                f"💰 <b>SMART MONEY ALERT</b>\n\n"
+                                f"{len(unique_wallets)} tracked wallets buying:\n"
+                                f"<code>{mint}</code>\n"
+                                f"Wallets: {tags}\n"
+                                f"Total: {total_sol:.2f} SOL\n"
+                                f"LP: ${liq:,.0f} | MCap: ${mcap:,.0f}\n\n"
+                                f"🔗 <a href='https://dexscreener.com/solana/{mint}'>chart</a> · "
+                                f"<a href='https://gmgn.ai/sol/token/{mint}'>gmgn</a>"
+                            )
                 
                 # Decay inactive wallets weekly
                 smart_money_tracker.decay_inactive(days_threshold=14)
