@@ -63,6 +63,7 @@ BIRDEYE_API_KEY    = os.getenv("BIRDEYE_API_KEY", "")
 ALERT_THRESHOLD    = float(os.getenv("ALERT_THRESHOLD", "5.0"))
 MIN_LIQUIDITY      = float(os.getenv("MIN_LIQUIDITY_USD", "5000"))
 MAX_ENTRY_MCAP     = float(os.getenv("MAX_ENTRY_MCAP", "100000"))
+MIN_BONDING_MCAP   = float(os.getenv("MIN_BONDING_MCAP", "3000"))  # For pump.fun tokens with $0 LP
 
 # Blacklist - reject tokens with these keywords even if they match narratives
 BLACKLIST_KEYWORDS_STR = os.getenv("BLACKLIST_KEYWORDS", "inu,wif,wif hat,with hat")
@@ -1230,6 +1231,7 @@ async def run_bot():
     log.info("=" * 50)
     log.info("  TekkiSniPer — BOT ONLINE [v3.0]")
     log.info(f"  Threshold: {ALERT_THRESHOLD}  MinLP: ${MIN_LIQUIDITY:,.0f}  MaxMCap: ${MAX_ENTRY_MCAP:,.0f}")
+    log.info(f"  Bonding curve min MCap: ${MIN_BONDING_MCAP:,.0f} (when LP=$0)")
     log.info(f"  Data: Birdeye -> DexScreener fallback")
     log.info(f"  Smart Money: {sm_status}")
     log.info(f"  Scoring: {'adaptive' if weight_optimizer else 'static'} weights")
@@ -1244,6 +1246,7 @@ async def run_bot():
     await send_telegram(
         "🎯 <b>TekkiSniPer ONLINE</b> [v3.0]\n"
         f"Threshold: {ALERT_THRESHOLD}/10  |  Min LP: ${MIN_LIQUIDITY:,.0f}  |  Max MCap: ${MAX_ENTRY_MCAP:,.0f}\n"
+        f"Bonding curve min: ${MIN_BONDING_MCAP:,.0f} (when LP=$0)\n"
         f"💰 Smart Money: {sm_status}\n"
         f"📊 Scoring: {'adaptive' if weight_optimizer else 'static'} weights\n"
         f"🛡️ Rug v2: honeypot sim + clusters + bundles\n"
@@ -1290,13 +1293,13 @@ async def _smart_money_scanner():
                             if len(unique_wallets) < 3:
                                 continue
                             
-                            # Quick LP check — skip if token has no liquidity
+                            # Quick quality check — skip if token has no liquidity AND low mcap
                             try:
                                 dex = await fetch_dexscreener(mint)
                                 liq = dex.get("liquidity_usd", 0)
                                 mcap = dex.get("mcap_usd", 0)
-                                if liq < MIN_LIQUIDITY:
-                                    log.info(f"[SmartMoney] {mint[:12]} — {len(unique_wallets)} wallets but LP ${liq:,.0f} < min — skip")
+                                if liq < MIN_LIQUIDITY and mcap < MIN_BONDING_MCAP:
+                                    log.info(f"[SmartMoney] {mint[:12]} — {len(unique_wallets)} wallets but LP ${liq:,.0f} MCap ${mcap:,.0f} — skip")
                                     continue
                             except Exception:
                                 continue  # Can't verify = skip
@@ -1406,14 +1409,23 @@ async def handle_token(sniper, msg: dict):
 
     log.info(f"  -> Source: {source}  liq=${token_data['liquidity_usd']:,.0f}  mcap=${token_data['mcap_usd']:,.0f}")
 
-    # Liquidity filter
-    if token_data["liquidity_usd"] < MIN_LIQUIDITY:
-        log.info(f"  -> LP ${token_data['liquidity_usd']:,.0f} < ${MIN_LIQUIDITY:,.0f} — skip")
+    # ── Quality gate: LP or MCap ─────────────────────────────────────────────
+    # Pump.fun bonding curve tokens have $0 LP (no DEX pool until graduation ~$69k).
+    # For these, mcap IS the quality signal. Accept if EITHER meets minimum.
+    liq = token_data["liquidity_usd"]
+    mcap = token_data.get("mcap_usd", 0)
+    
+    if liq >= MIN_LIQUIDITY:
+        pass  # Has real LP — good (migrated token)
+    elif mcap >= MIN_BONDING_MCAP:
+        pass  # No LP but bonding curve has traction — acceptable
+    else:
+        log.info(f"  -> LP ${liq:,.0f} & MCap ${mcap:,.0f} below minimums — skip")
         return
     
-    # MCap filter (prefer micro caps with more upside)
-    if token_data.get("mcap_usd", 0) > MAX_ENTRY_MCAP:
-        log.info(f"  -> MCap ${token_data['mcap_usd']:,.0f} > ${MAX_ENTRY_MCAP:,.0f} — skip")
+    # MCap ceiling (prefer micro caps with more upside)
+    if mcap > MAX_ENTRY_MCAP:
+        log.info(f"  -> MCap ${mcap:,.0f} > ${MAX_ENTRY_MCAP:,.0f} — skip")
         return
 
     # Holder filters (only when source provides real holder data)
@@ -1524,15 +1536,23 @@ async def handle_token(sniper, msg: dict):
     # ── Use the HIGHER of v1 and v2 flags for safety ──────────────────────────
     effective_rug_score = rug_v2_report.rug_score if rug_v2_report else rug_score
     
-    # Critical: Skip if v2 rug flags are severe
+    # Critical v2 flags (honeypot, etc.) — always skip
     v2_flags = rug_v2_report.flags if rug_v2_report else []
     critical_v2_flags = [f for f in v2_flags if hasattr(f, 'severity') and f.severity == "critical"]
     
-    # Use v1 flag check as before, plus v2 critical flags
-    if flags and len(flags) > 0:
+    # v1 flags: Only hard-skip on the truly dangerous ones.
+    # Pump.fun tokens ALWAYS have mint/freeze authority active + no LP lock,
+    # so blocking on any flag = blocking 100% of tokens.
+    HARD_BLOCK_FLAGS = {"HONEYPOT_DETECTED", "MASSIVE_DEV_DUMP", "LP_FULLY_DRAINED"}
+    if flags:
+        hard_flags = [f for f in flags if f.get('code') in HARD_BLOCK_FLAGS]
+        if hard_flags:
+            flag_codes = [f['code'] for f in hard_flags[:3]]
+            log.info(f"  -> Critical v1 flags {flag_codes} — skip")
+            return
+        # Log non-critical flags but continue
         flag_codes = [f['code'] for f in flags[:3]]
-        log.info(f"  -> v1 Flags {flag_codes} — skip")
-        return
+        log.info(f"  -> v1 flags (non-blocking): {flag_codes}")
     
     if critical_v2_flags:
         flag_codes = [f.code for f in critical_v2_flags[:3]]
