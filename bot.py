@@ -1463,21 +1463,21 @@ async def handle_token(sniper, msg: dict):
 
     # ── v2: Rug Analysis (on-chain + honeypot + clusters + bundles) ───────────
     rug_v2_report = None
+    is_bc = token_data.get("liquidity_usd", 0) < 1000
     if rug_analyzer_v2:
         try:
             async with httpx.AsyncClient(timeout=20) as session:
                 rug_v2_report = await rug_analyzer_v2.analyze(
-                    session, mint, deployer=deployer, name=name, symbol=symbol
+                    session, mint, deployer=deployer, name=name, symbol=symbol,
+                    is_bonding_curve=is_bc
                 )
                 log.info(f"  -> v2 Rug: {rug_v2_report.rug_score}/10 — {rug_v2_report.verdict}")
                 if rug_v2_report.honeypot_data and rug_v2_report.honeypot_data.is_honeypot:
                     log.info(f"  -> 🍯 HONEYPOT DETECTED — skip")
                     return
                 
-                # FALLBACK: If rug_v2 scored 8+ on a bonding curve token AND we saw
-                # DNS/connection errors, the high score is from missing data, not real risk.
-                # Use v1 rug score instead so we don't block everything when Helius is down.
-                is_bc = token_data.get("liquidity_usd", 0) < 1000
+                # FALLBACK: If rug_v2 scored 8+ AND we saw errors (no real data),
+                # the high score is from missing data. Fall back to v1.
                 if is_bc and rug_v2_report.rug_score >= 8.0:
                     # Check if the report had errors (no real data)
                     has_holder_data = rug_v2_report.holder_data and rug_v2_report.holder_data.total_holders > 0
