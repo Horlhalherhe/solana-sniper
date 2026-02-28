@@ -1473,6 +1473,18 @@ async def handle_token(sniper, msg: dict):
                 if rug_v2_report.honeypot_data and rug_v2_report.honeypot_data.is_honeypot:
                     log.info(f"  -> 🍯 HONEYPOT DETECTED — skip")
                     return
+                
+                # FALLBACK: If rug_v2 scored 8+ on a bonding curve token AND we saw
+                # DNS/connection errors, the high score is from missing data, not real risk.
+                # Use v1 rug score instead so we don't block everything when Helius is down.
+                is_bc = token_data.get("liquidity_usd", 0) < 1000
+                if is_bc and rug_v2_report.rug_score >= 8.0:
+                    # Check if the report had errors (no real data)
+                    has_holder_data = rug_v2_report.holder_data and rug_v2_report.holder_data.total_holders > 0
+                    has_deployer_data = rug_v2_report.deployer_data and rug_v2_report.deployer_data.age_days > 0
+                    if not has_holder_data and not has_deployer_data:
+                        log.info(f"  -> v2 Rug likely inaccurate (no on-chain data) — using v1 rug score {rug_score}/10")
+                        rug_v2_report = None  # Discard bad v2 report, fall back to v1
         except Exception as e:
             log.warning(f"  -> Rug v2 error (using v1 fallback): {e}")
 
