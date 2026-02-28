@@ -726,31 +726,55 @@ class RugAnalyzerV2:
         """
         Evaluate all risk flags based on collected data.
         
-        When is_bonding_curve=True, skip flags that are NORMAL for pump.fun
-        bonding curve tokens: mint/freeze authority active, no LP lock, low LP.
-        Still flag: wallet clusters, holder concentration, deployer history,
-        honeypot (if checked), bundles — those are real risk signals.
+        BONDING CURVE (pump.fun) — these are ALL normal, NOT rug signals:
+          - Mint/freeze authority active (standard during bonding curve)
+          - No LP lock (no DEX pool exists yet)
+          - Low liquidity (bonding curve reserve, not a pool)
+          - Top holders concentrated (6-50 holders = everyone owns a big %)
+          - Fresh deployer wallet (disposable wallets are standard)
+          - No social links (most pump.fun tokens don't have websites)
+        
+        REAL risk signals even on pump.fun:
+          - Wallet clusters (coordinated buying = rug setup)
+          - Serial deployer (10+ tokens in 30 days = rug factory)
+          - Deployer rugged before (proven rugger)
+          - Heavily bundled (botted launch)
         """
         active = []
         
-        # Contract flags — SKIP for bonding curve (always active on pump.fun)
-        if not is_bonding_curve:
+        if is_bonding_curve:
+            # ── BONDING CURVE MODE: only flag genuine risk ──────────────
+            # Wallet clusters — coordinated buying is a real rug signal
+            if holders.wallet_clusters_detected > 0:
+                active.append(FLAGS["WALLET_CLUSTER"])
+            
+            # Deployer history — proven ruggers and rug factories
+            if deployer.rugged_tokens:
+                active.append(FLAGS["DEPLOYER_RUGGED_BEFORE"])
+            if deployer.tokens_last_30d > 10:
+                active.append(FLAGS["DEPLOYER_SERIAL"])
+            
+            # Bundles — heavy bot activity at launch
+            if bundles.is_heavily_bundled:
+                active.append(FLAGS["HEAVILY_BUNDLED"])
+            
+        else:
+            # ── MIGRATED/DEX TOKEN MODE: full analysis ──────────────────
+            # Contract
             if not contract.get("mint_revoked", True):
                 active.append(FLAGS["MINT_AUTH_ACTIVE"])
             if not contract.get("freeze_revoked", True):
                 active.append(FLAGS["FREEZE_AUTH_ACTIVE"])
-        if not contract.get("has_social", True):
-            active.append(FLAGS["NO_SOCIAL"])
-        
-        # Honeypot flags (only for migrated tokens — skipped for bonding curve)
-        if not is_bonding_curve:
+            if not contract.get("has_social", True):
+                active.append(FLAGS["NO_SOCIAL"])
+            
+            # Honeypot
             if honeypot.is_honeypot:
                 active.append(FLAGS["HONEYPOT_DETECTED"])
             elif honeypot.is_suspicious:
                 active.append(FLAGS["HONEYPOT_SUSPICIOUS"])
-        
-        # Liquidity flags — SKIP for bonding curve (no DEX pool exists yet)
-        if not is_bonding_curve:
+            
+            # Liquidity
             if lp.liquidity_usd > 0:
                 if not lp.is_burned and not lp.is_locked:
                     active.append(FLAGS["LP_NOT_LOCKED"])
@@ -758,28 +782,28 @@ class RugAnalyzerV2:
                     active.append(FLAGS["LP_LOW"])
                 if lp.lock_expiry_days is not None and lp.lock_expiry_days <= 7:
                     active.append(FLAGS["LP_UNLOCK_SOON"])
-        
-        # Holder flags — ALWAYS check (real risk signal)
-        if holders.top10_pct > 30:
-            active.append(FLAGS["TOP10_OVER_30"])
-        if holders.top1_pct > 5:
-            active.append(FLAGS["TOP1_OVER_5"])
-        if holders.wallet_clusters_detected > 0:
-            active.append(FLAGS["WALLET_CLUSTER"])
-        
-        # Bundle flags — ALWAYS check (real risk signal)
-        if bundles.is_heavily_bundled:
-            active.append(FLAGS["HEAVILY_BUNDLED"])
-        
-        # Deployer flags — ALWAYS check (real risk signal)
-        if deployer.rugged_tokens:
-            active.append(FLAGS["DEPLOYER_RUGGED_BEFORE"])
-        if deployer.age_days < 7 and deployer.age_days >= 0:
-            active.append(FLAGS["DEPLOYER_FRESH_WALLET"])
-        if deployer.tokens_last_30d > 10:
-            active.append(FLAGS["DEPLOYER_SERIAL"])
-        if 0 < deployer.sol_balance < 0.5:
-            active.append(FLAGS["DEPLOYER_LOW_SOL"])
+            
+            # Holders
+            if holders.top10_pct > 30:
+                active.append(FLAGS["TOP10_OVER_30"])
+            if holders.top1_pct > 5:
+                active.append(FLAGS["TOP1_OVER_5"])
+            if holders.wallet_clusters_detected > 0:
+                active.append(FLAGS["WALLET_CLUSTER"])
+            
+            # Bundles
+            if bundles.is_heavily_bundled:
+                active.append(FLAGS["HEAVILY_BUNDLED"])
+            
+            # Deployer
+            if deployer.rugged_tokens:
+                active.append(FLAGS["DEPLOYER_RUGGED_BEFORE"])
+            if deployer.age_days < 7 and deployer.age_days >= 0:
+                active.append(FLAGS["DEPLOYER_FRESH_WALLET"])
+            if deployer.tokens_last_30d > 10:
+                active.append(FLAGS["DEPLOYER_SERIAL"])
+            if 0 < deployer.sol_balance < 0.5:
+                active.append(FLAGS["DEPLOYER_LOW_SOL"])
         
         return active
     
