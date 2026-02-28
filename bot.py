@@ -63,7 +63,7 @@ BIRDEYE_API_KEY    = os.getenv("BIRDEYE_API_KEY", "")
 ALERT_THRESHOLD    = float(os.getenv("ALERT_THRESHOLD", "5.0"))
 MIN_LIQUIDITY      = float(os.getenv("MIN_LIQUIDITY_USD", "5000"))
 MAX_ENTRY_MCAP     = float(os.getenv("MAX_ENTRY_MCAP", "100000"))
-MIN_BONDING_MCAP   = float(os.getenv("MIN_BONDING_MCAP", "3000"))  # For pump.fun tokens with $0 LP
+MIN_BONDING_MCAP   = float(os.getenv("MIN_BONDING_MCAP", "2000"))  # For pump.fun tokens with $0 LP
 
 # Blacklist - reject tokens with these keywords even if they match narratives
 BLACKLIST_KEYWORDS_STR = os.getenv("BLACKLIST_KEYWORDS", "inu,wif,wif hat,with hat")
@@ -1390,15 +1390,15 @@ async def handle_token(sniper, msg: dict):
             log.info(f"  -> Blacklisted keyword '{blacklisted}' detected — skip")
             return
 
-    # Wait 150s then fetch (gives pools time to form and DexScreener time to index)
-    await asyncio.sleep(150)
+    # Wait 60s then fetch (gives DexScreener time to index without missing the move)
+    await asyncio.sleep(60)
     token_data, source = await enrich_token(mint, name, symbol, deployer)
     token_data["description"] = desc
 
-    # If no market data yet, wait 60s and try once more
+    # If no market data yet, wait 45s and try once more
     if source == "none":
-        log.info(f"  -> No market data yet — retrying in 60s...")
-        await asyncio.sleep(60)
+        log.info(f"  -> No market data yet — retrying in 45s...")
+        await asyncio.sleep(45)
         token_data, source = await enrich_token(mint, name, symbol, deployer)
         token_data["description"] = desc
 
@@ -1442,6 +1442,7 @@ async def handle_token(sniper, msg: dict):
             return
 
     # ── v1 analysis (narrative + entry + rug) ─────────────────────────────────
+    log.info(f"  -> ✅ PASSED FILTERS — entering scoring pipeline")
     alert       = sniper.analyze_token(token_data)
     entry_score = alert.entry.get("final_score", 0)
     rug_score   = alert.rug.get("rug_score", 10)
@@ -1523,6 +1524,8 @@ async def handle_token(sniper, msg: dict):
                 # Bundles (NEW)
                 sniper_count=rug_v2_report.bundle_data.sniper_estimate if rug_v2_report and rug_v2_report.bundle_data else 0,
                 is_heavily_bundled=rug_v2_report.bundle_data.is_heavily_bundled if rug_v2_report and rug_v2_report.bundle_data else False,
+                # Pump.fun bonding curve detection
+                is_bonding_curve=token_data.get("liquidity_usd", 0) < 1000,  # No real LP = bonding curve
             )
 
             v2_score_result = scorer_v2.score(v2_input)
