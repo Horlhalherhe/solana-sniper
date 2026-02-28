@@ -53,6 +53,7 @@ class EntryInputV2:
     freeze_authority_revoked: bool = True
     lp_burned: bool = False
     lp_locked: bool = False
+    is_bonding_curve: bool = False  # True if pump.fun token not yet migrated
     sniper_count: int = 0
     is_heavily_bundled: bool = False
     deployer_is_serial: bool = False
@@ -218,7 +219,7 @@ class EntryScorerV2:
         if d.volume_1h_usd > 500_000:   score += 2.5
         elif d.volume_1h_usd > 100_000: score += 1.5
         elif d.volume_1h_usd > 10_000:  score += 0.5
-        elif d.volume_1h_usd < 1_000:   score -= 2.0
+        elif d.volume_1h_usd < 1_000:   score -= 1.0  # Reduced penalty (was -2.0)
         
         if d.buy_sell_ratio_1h > 3.0:   score += 2.0
         elif d.buy_sell_ratio_1h > 2.0: score += 1.0
@@ -230,8 +231,10 @@ class EntryScorerV2:
         elif pc > 200:      score -= 1.0
         elif pc < -20:      score -= 2.0
         
-        if d.lp_usd > 100_000:  score += 1.0
-        elif d.lp_usd < 5_000:  score -= 1.5
+        # LP — skip penalty for bonding curve tokens (they don't have LP pools)
+        if not d.is_bonding_curve:
+            if d.lp_usd > 100_000:  score += 1.0
+            elif d.lp_usd < 5_000:  score -= 1.5
         
         return max(min(score, 10.0), 1.0)
     
@@ -264,33 +267,58 @@ class EntryScorerV2:
         """
         NEW: Inverted rug score — high = safe, low = risky.
         Incorporates honeypot data from v2.
-        """
-        # Start with inverted rug score
-        score = 10.0 - d.rug_score  # rug_score 2 → safety 8
         
-        # Honeypot override
+        PUMP.FUN BONDING CURVE HANDLING:
+        Bonding curve tokens ALWAYS have mint/freeze authority active and no LP.
+        This is normal behavior, not a rug signal. We skip those penalties for
+        bonding curve tokens and rely on deployer + holder + honeypot signals instead.
+        """
+        # Honeypot override — always deadly regardless of source
         if d.is_honeypot:
             return 1.0
-        if d.is_honeypot_suspicious:
-            score = min(score, 3.0)
         
-        # High sell tax
-        if d.honeypot_sell_tax_pct > 30:
-            score -= 3.0
-        elif d.honeypot_sell_tax_pct > 15:
-            score -= 1.5
-        
-        # Authority checks
-        if not d.mint_authority_revoked:
-            score -= 2.0
-        if not d.freeze_authority_revoked:
-            score -= 1.5
-        
-        # LP status
-        if d.lp_burned:
-            score += 1.0
-        elif not d.lp_locked:
-            score -= 1.0
+        if d.is_bonding_curve:
+            # Bonding curve tokens: start neutral, penalize only real risk signals
+            score = 6.0  # Neutral starting point
+            
+            # Honeypot suspicion still matters
+            if d.is_honeypot_suspicious:
+                score -= 2.0
+            if d.honeypot_sell_tax_pct > 30:
+                score -= 3.0
+            elif d.honeypot_sell_tax_pct > 15:
+                score -= 1.5
+            
+            # Dev holds too much — real risk even on bonding curve
+            if d.dev_holds_pct > 5.0:
+                score -= 1.5
+            elif d.dev_holds_pct > 2.0:
+                score -= 0.5
+            
+            # Serial deployer — real risk signal
+            if d.deployer_is_serial:
+                score -= 2.0
+            if d.deployer_prev_rugs > 0:
+                score -= 3.0
+            
+        else:
+            # Migrated/DEX tokens: original logic
+            score = 10.0 - d.rug_score
+            
+            if d.is_honeypot_suspicious:
+                score = min(score, 3.0)
+            if d.honeypot_sell_tax_pct > 30:
+                score -= 3.0
+            elif d.honeypot_sell_tax_pct > 15:
+                score -= 1.5
+            if not d.mint_authority_revoked:
+                score -= 2.0
+            if not d.freeze_authority_revoked:
+                score -= 1.5
+            if d.lp_burned:
+                score += 1.0
+            elif not d.lp_locked:
+                score -= 1.0
         
         return max(min(score, 10.0), 1.0)
     
