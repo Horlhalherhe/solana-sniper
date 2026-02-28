@@ -1578,6 +1578,15 @@ async def handle_token(sniper, msg: dict):
         log.info(f"  -> v2 Critical flags {flag_codes} — skip")
         return
 
+    # ── Hard rug gate — if rug analyzer says LIKELY RUG, don't alert ─────────
+    # This is non-negotiable. A 8.5/10 rug score means the token has real risk
+    # signals (wallet clusters, serial deployer, etc). No narrative score should
+    # override that.
+    MAX_RUG_SCORE = float(os.getenv("MAX_RUG_SCORE", "7.0"))
+    if effective_rug_score >= MAX_RUG_SCORE:
+        log.info(f"  -> ❌ Rug score {effective_rug_score}/10 >= {MAX_RUG_SCORE} — blocked (entry was {v2_entry_score:.1f})")
+        return
+
     # ── Decision: use v2 score if available, else v1 ──────────────────────────
     final_score = v2_entry_score
 
