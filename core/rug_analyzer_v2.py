@@ -21,7 +21,7 @@ HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "")
 HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 HELIUS_API = f"https://api.helius.xyz/v0"
-JUPITER_API = "https://quote-api.jup.ag/v6"
+JUPITER_API = "https://api.jup.ag/swap/v1"
 
 # ── Risk Flags ───────────────────────────────────────────────────────
 
@@ -182,28 +182,44 @@ class RugAnalyzerV2:
         self.meta_intel = meta_intel
     
     async def analyze(self, session: httpx.AsyncClient, mint: str,
-                      deployer: str = None, name: str = "", symbol: str = "") -> RugReport:
+                      deployer: str = None, name: str = "", symbol: str = "",
+                      is_bonding_curve: bool = False) -> RugReport:
         """
         Run full on-chain rug analysis.
         
-        This is the main entry point. It fetches all data from chain
-        and returns a complete rug report.
+        Args:
+            is_bonding_curve: If True, skip flags that are normal for pump.fun
+                            bonding curve tokens (mint/freeze authority, no LP).
         """
         print(f"[RugV2] Analyzing {mint[:16]}...")
         start = datetime.now(timezone.utc)
         
         # Fetch all data in parallel where possible
-        contract_data, holder_data, lp_data, deployer_data, honeypot_data, bundle_data = (
-            await asyncio.gather(
-                self._check_contract(session, mint),
-                self._check_holders(session, mint, deployer),
-                self._check_liquidity(session, mint),
-                self._check_deployer(session, deployer or "", mint),
-                self._check_honeypot(session, mint),
-                self._check_bundles(session, mint),
-                return_exceptions=True,
+        # Skip honeypot check for bonding curve tokens — Jupiter can't route them
+        if is_bonding_curve:
+            contract_data, holder_data, lp_data, deployer_data, bundle_data = (
+                await asyncio.gather(
+                    self._check_contract(session, mint),
+                    self._check_holders(session, mint, deployer),
+                    self._check_liquidity(session, mint),
+                    self._check_deployer(session, deployer or "", mint),
+                    self._check_bundles(session, mint),
+                    return_exceptions=True,
+                )
             )
-        )
+            honeypot_data = HoneypotResult()  # Skip — Jupiter can't route bonding curve
+        else:
+            contract_data, holder_data, lp_data, deployer_data, honeypot_data, bundle_data = (
+                await asyncio.gather(
+                    self._check_contract(session, mint),
+                    self._check_holders(session, mint, deployer),
+                    self._check_liquidity(session, mint),
+                    self._check_deployer(session, deployer or "", mint),
+                    self._check_honeypot(session, mint),
+                    self._check_bundles(session, mint),
+                    return_exceptions=True,
+                )
+            )
         
         # Handle exceptions from parallel execution
         if isinstance(contract_data, Exception):
@@ -218,16 +234,17 @@ class RugAnalyzerV2:
         if isinstance(deployer_data, Exception):
             print(f"  [RugV2] Deployer check failed: {deployer_data}")
             deployer_data = DeployerData(wallet=deployer or "")
-        if isinstance(honeypot_data, Exception):
+        if not is_bonding_curve and isinstance(honeypot_data, Exception):
             print(f"  [RugV2] Honeypot check failed: {honeypot_data}")
             honeypot_data = HoneypotResult()
         if isinstance(bundle_data, Exception):
             print(f"  [RugV2] Bundle check failed: {bundle_data}")
             bundle_data = BundleData()
         
-        # Evaluate flags
+        # Evaluate flags — pass bonding_curve flag so normal BC behavior isn't penalized
         flags = self._evaluate_flags(contract_data, holder_data, lp_data, 
-                                      deployer_data, honeypot_data, bundle_data)
+                                      deployer_data, honeypot_data, bundle_data,
+                                      is_bonding_curve=is_bonding_curve)
         
         # Calculate rug score
         rug_score = self._calculate_score(flags)
@@ -704,34 +721,45 @@ class RugAnalyzerV2:
     
     def _evaluate_flags(self, contract: dict, holders: HolderData, 
                         lp: LiquidityData, deployer: DeployerData,
-                        honeypot: HoneypotResult, bundles: BundleData) -> list:
-        """Evaluate all risk flags based on collected data"""
+                        honeypot: HoneypotResult, bundles: BundleData,
+                        is_bonding_curve: bool = False) -> list:
+        """
+        Evaluate all risk flags based on collected data.
+        
+        When is_bonding_curve=True, skip flags that are NORMAL for pump.fun
+        bonding curve tokens: mint/freeze authority active, no LP lock, low LP.
+        Still flag: wallet clusters, holder concentration, deployer history,
+        honeypot (if checked), bundles — those are real risk signals.
+        """
         active = []
         
-        # Contract flags
-        if not contract.get("mint_revoked", True):
-            active.append(FLAGS["MINT_AUTH_ACTIVE"])
-        if not contract.get("freeze_revoked", True):
-            active.append(FLAGS["FREEZE_AUTH_ACTIVE"])
+        # Contract flags — SKIP for bonding curve (always active on pump.fun)
+        if not is_bonding_curve:
+            if not contract.get("mint_revoked", True):
+                active.append(FLAGS["MINT_AUTH_ACTIVE"])
+            if not contract.get("freeze_revoked", True):
+                active.append(FLAGS["FREEZE_AUTH_ACTIVE"])
         if not contract.get("has_social", True):
             active.append(FLAGS["NO_SOCIAL"])
         
-        # Honeypot flags (NEW in v2)
-        if honeypot.is_honeypot:
-            active.append(FLAGS["HONEYPOT_DETECTED"])
-        elif honeypot.is_suspicious:
-            active.append(FLAGS["HONEYPOT_SUSPICIOUS"])
+        # Honeypot flags (only for migrated tokens — skipped for bonding curve)
+        if not is_bonding_curve:
+            if honeypot.is_honeypot:
+                active.append(FLAGS["HONEYPOT_DETECTED"])
+            elif honeypot.is_suspicious:
+                active.append(FLAGS["HONEYPOT_SUSPICIOUS"])
         
-        # Liquidity flags
-        if lp.liquidity_usd > 0:
-            if not lp.is_burned and not lp.is_locked:
-                active.append(FLAGS["LP_NOT_LOCKED"])
-            if lp.liquidity_usd < 10_000:
-                active.append(FLAGS["LP_LOW"])
-            if lp.lock_expiry_days is not None and lp.lock_expiry_days <= 7:
-                active.append(FLAGS["LP_UNLOCK_SOON"])
+        # Liquidity flags — SKIP for bonding curve (no DEX pool exists yet)
+        if not is_bonding_curve:
+            if lp.liquidity_usd > 0:
+                if not lp.is_burned and not lp.is_locked:
+                    active.append(FLAGS["LP_NOT_LOCKED"])
+                if lp.liquidity_usd < 10_000:
+                    active.append(FLAGS["LP_LOW"])
+                if lp.lock_expiry_days is not None and lp.lock_expiry_days <= 7:
+                    active.append(FLAGS["LP_UNLOCK_SOON"])
         
-        # Holder flags
+        # Holder flags — ALWAYS check (real risk signal)
         if holders.top10_pct > 30:
             active.append(FLAGS["TOP10_OVER_30"])
         if holders.top1_pct > 5:
@@ -739,11 +767,11 @@ class RugAnalyzerV2:
         if holders.wallet_clusters_detected > 0:
             active.append(FLAGS["WALLET_CLUSTER"])
         
-        # Bundle flags (NEW in v2)
+        # Bundle flags — ALWAYS check (real risk signal)
         if bundles.is_heavily_bundled:
             active.append(FLAGS["HEAVILY_BUNDLED"])
         
-        # Deployer flags
+        # Deployer flags — ALWAYS check (real risk signal)
         if deployer.rugged_tokens:
             active.append(FLAGS["DEPLOYER_RUGGED_BEFORE"])
         if deployer.age_days < 7 and deployer.age_days >= 0:
