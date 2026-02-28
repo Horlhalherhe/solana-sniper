@@ -1419,12 +1419,14 @@ async def handle_token(sniper, msg: dict):
         pass  # Has real LP — good (migrated token)
     elif mcap >= MIN_BONDING_MCAP:
         pass  # No LP but bonding curve has traction — acceptable
+    elif liq >= 2000 and mcap == 0:
+        pass  # Birdeye reports BC reserve as LP but can't price mcap — acceptable
     else:
         log.info(f"  -> LP ${liq:,.0f} & MCap ${mcap:,.0f} below minimums — skip")
         return
     
-    # MCap ceiling (prefer micro caps with more upside)
-    if mcap > MAX_ENTRY_MCAP:
+    # MCap ceiling (prefer micro caps with more upside) — skip check if mcap unknown
+    if mcap > 0 and mcap > MAX_ENTRY_MCAP:
         log.info(f"  -> MCap ${mcap:,.0f} > ${MAX_ENTRY_MCAP:,.0f} — skip")
         return
 
@@ -1463,7 +1465,9 @@ async def handle_token(sniper, msg: dict):
 
     # ── v2: Rug Analysis (on-chain + honeypot + clusters + bundles) ───────────
     rug_v2_report = None
-    is_bc = token_data.get("liquidity_usd", 0) < 1000
+    # Detect bonding curve: mcap=$0 (Birdeye can't price BC tokens) OR very low LP
+    # Birdeye reports the bonding curve SOL reserve as "liquidity" (~$2-5k) but mcap=$0
+    is_bc = token_data.get("mcap_usd", 0) < 1000 or token_data.get("liquidity_usd", 0) < 1000
     if rug_analyzer_v2:
         try:
             async with httpx.AsyncClient(timeout=20) as session:
@@ -1537,7 +1541,7 @@ async def handle_token(sniper, msg: dict):
                 sniper_count=rug_v2_report.bundle_data.sniper_estimate if rug_v2_report and rug_v2_report.bundle_data else 0,
                 is_heavily_bundled=rug_v2_report.bundle_data.is_heavily_bundled if rug_v2_report and rug_v2_report.bundle_data else False,
                 # Pump.fun bonding curve detection
-                is_bonding_curve=token_data.get("liquidity_usd", 0) < 1000,  # No real LP = bonding curve
+                is_bonding_curve=is_bc,  # Bonding curve = mcap $0 or LP < $1k
             )
 
             v2_score_result = scorer_v2.score(v2_input)
