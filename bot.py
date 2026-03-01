@@ -525,7 +525,7 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> Tupl
     }
     source = "none"
 
-    # Helius: mint/freeze + dev wallet check
+    # Helius: mint/freeze + dev wallet + top holders
     if HELIUS_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=8) as client:
@@ -540,7 +540,9 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> Tupl
                         base["mint_authority_revoked"] = info.get("mintAuthority") is None
                         base["freeze_authority_revoked"] = info.get("freezeAuthority") is None
                         supply = float(info.get("supply", 0)) / (10 ** info.get("decimals", 0))
+                        decimals = info.get("decimals", 0)
                         
+                        # Dev wallet check
                         if supply > 0 and deployer:
                             bal_resp = await client.post(
                                 f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
@@ -555,6 +557,34 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> Tupl
                                     log.info(f"  -> Dev: {dev_bal:,.0f} / {supply:,.0f} ({base['dev_holds_pct']:.1f}%)")
                                 else:
                                     log.info(f"  -> Dev: 0 tokens")
+                        
+                        # Top holders check (real on-chain data)
+                        if supply > 0:
+                            try:
+                                top_resp = await client.post(
+                                    f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
+                                    json={"jsonrpc": "2.0", "id": 3, "method": "getTokenLargestAccounts",
+                                          "params": [mint]})
+                                if top_resp.status_code == 200:
+                                    accounts = top_resp.json().get("result", {}).get("value", [])
+                                    if accounts:
+                                        # Calculate top1 and top10 percentages
+                                        amounts = []
+                                        for acc in accounts[:20]:
+                                            amt_str = acc.get("amount", "0")
+                                            ui_amt = float(amt_str) / (10 ** decimals) if decimals > 0 else float(amt_str)
+                                            amounts.append(ui_amt)
+                                        
+                                        if amounts and supply > 0:
+                                            top1_pct = (amounts[0] / supply) * 100
+                                            top10_sum = sum(amounts[:10])
+                                            top10_pct = (top10_sum / supply) * 100
+                                            base["top1_pct"] = round(top1_pct, 1)
+                                            base["top10_pct"] = round(top10_pct, 1)
+                                            base["total_holders"] = max(len(accounts), base["total_holders"])
+                                            log.info(f"  -> Holders: top1={top1_pct:.1f}% top10={top10_pct:.1f}% ({len(accounts)} accounts)")
+                            except Exception as e:
+                                log.warning(f"[Helius] Top holders: {e}")
         except Exception as e:
             log.warning(f"[Helius] {e}")
 
@@ -973,6 +1003,73 @@ async def handle_commands():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# COPYCAT DETECTION — skip PVP copies of existing tokens
+# ═══════════════════════════════════════════════════════════════════════════════
+COPYCAT_MIN_MCAP = float(os.getenv("COPYCAT_MIN_MCAP", "50000"))  # Existing token must have this mcap to count
+
+async def check_copycat(symbol: str, name: str, new_mint: str) -> bool:
+    """
+    Search DexScreener for existing tokens with the same symbol or name.
+    If one already exists with real mcap (>$50k), this new token is a PVP copy.
+    """
+    if not symbol or len(symbol) < 2:
+        return False
+    
+    # Search by symbol first, then by name if different
+    search_terms = [symbol]
+    # Clean name: take first meaningful word (skip "The", "Baby", etc.)
+    name_clean = name.strip().split()[0] if name else ""
+    if name_clean.lower() not in [symbol.lower(), "the", "baby", "king", "queen", "sir", "mr", "ms", "dr", "new"]:
+        if len(name_clean) >= 3:
+            search_terms.append(name_clean)
+    
+    try:
+        async with httpx.AsyncClient(timeout=6) as client:
+            for term in search_terms:
+                resp = await client.get(
+                    f"https://api.dexscreener.com/latest/dex/search?q={term}",
+                    headers={"User-Agent": "Mozilla/5.0"})
+                if resp.status_code != 200:
+                    continue
+                
+                pairs = resp.json().get("pairs") or []
+                for pair in pairs:
+                    base_token = pair.get("baseToken") or {}
+                    
+                    # Skip if same token
+                    if base_token.get("address", "") == new_mint:
+                        continue
+                    
+                    # Must be Solana
+                    if pair.get("chainId", "") != "solana":
+                        continue
+                    
+                    # Check symbol or name match
+                    existing_sym = base_token.get("symbol", "").upper()
+                    existing_name = base_token.get("name", "").lower()
+                    
+                    sym_match = (existing_sym == symbol.upper())
+                    name_match = (name.lower() in existing_name or existing_name in name.lower()) and len(existing_name) >= 3
+                    
+                    if not sym_match and not name_match:
+                        continue
+                    
+                    # Check mcap
+                    existing_mcap = float(pair.get("marketCap") or pair.get("fdv") or 0)
+                    existing_liq = float((pair.get("liquidity") or {}).get("usd") or 0)
+                    
+                    if existing_mcap >= COPYCAT_MIN_MCAP or existing_liq >= COPYCAT_MIN_MCAP:
+                        log.info(f"  -> Found existing: {base_token.get('name','?')} (${existing_sym}) mcap=${existing_mcap:,.0f} liq=${existing_liq:,.0f}")
+                        return True
+                
+                await asyncio.sleep(0.2)  # Rate limit between searches
+    except Exception as e:
+        log.warning(f"[Copycat] Check failed: {e}")
+    
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN TOKEN HANDLER
 # ═══════════════════════════════════════════════════════════════════════════════
 async def handle_token(msg: dict):
@@ -1006,6 +1103,12 @@ async def handle_token(msg: dict):
         if bl in combined:
             log.info(f"  -> Blacklisted '{bl}' — skip")
             return
+
+    # ── Copycat filter — skip if established token with same symbol/name exists ──
+    is_copy = await check_copycat(symbol, name, mint)
+    if is_copy:
+        log.info(f"  -> ❌ Copycat of existing token — skip (PVP trap)")
+        return
 
     # ── Wait for data ────────────────────────────────────────────────────────
     await asyncio.sleep(WAIT_SECONDS)
@@ -1053,7 +1156,7 @@ async def handle_token(msg: dict):
         return
 
     # ── Score ────────────────────────────────────────────────────────────────
-    log.info(f"  -> ✅ PASSED FILTERS — scoring")
+    log.info(f"  -> ✅ PASSED FILTERS — dev={dev_pct:.1f}% top10={top10:.1f}% — scoring")
     result = score_token(token, narrative)
     score = result["final_score"]
     log.info(f"  -> Score: {score}/10  {result['verdict']}")
