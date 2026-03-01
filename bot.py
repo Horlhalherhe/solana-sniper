@@ -578,6 +578,8 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> Tupl
                             "price_change_1h_pct": float(d.get("priceChange1hPercent") or 0),
                             "buy_sell_ratio_1h": int(d.get("buy1h") or 1) / max(int(d.get("sell1h") or 1), 1),
                             "total_holders": int(d.get("holder") or 50),
+                            "top1_pct": float(d.get("top1HolderPercent") or 5),
+                            "top10_pct": float(d.get("top10HolderPercent") or 25),
                         })
                         log.info(f"  -> Birdeye: liq=${liq:,.0f} mcap=${mc:,.0f}")
                         source = "birdeye"
@@ -630,7 +632,7 @@ def format_alert(token: dict, score: dict, narrative: dict) -> str:
     mint = token.get("mint", "")
     comps = score["components"]
     lines = [
-        "🎯 <b>SNIPER ALERT [v4]</b>", "",
+        "🎯 <b>TekkiSniPer</b>", "",
         f"<b>{token.get('name','?')}</b>  <code>${token.get('symbol','?')}</code>",
         f"<code>{mint}</code>", "",
         f"📊 <b>SCORE: {score['final_score']}/10</b>  {score['verdict']}",
@@ -644,6 +646,7 @@ def format_alert(token: dict, score: dict, narrative: dict) -> str:
         f"💰 MCap:       <b>${token.get('mcap_usd', 0):,.0f}</b>",
         f"💧 Liquidity:  <b>${token.get('liquidity_usd', 0):,.0f}</b>",
         f"👥 Holders:    <b>{token.get('total_holders', 0)}</b>",
+        f"🏦 Top10:      <b>{token.get('top10_pct', 0):.1f}%</b>",
         f"📈 Vol 1h:     <b>${token.get('volume_1h_usd', 0):,.0f}</b>",
         f"👨‍💻 Dev holds:  <b>{token.get('dev_holds_pct', 0):.1f}%</b>",
         "",
@@ -879,15 +882,17 @@ async def handle_commands():
         try:
             all_t = []
             async with tracked_lock:
-                all_t.extend(tracked.values())
+                for t in tracked.values():
+                    all_t.append(t)
             async with history_lock:
                 for r in leaderboard_history:
                     try:
-                        t = TrackedToken(r["mint"], r["name"], r["symbol"],
-                                        r["entry_mcap"], r["entry_score"], r.get("narrative", "?"))
-                        t.peak_x = r["peak_x"]
-                        t.current_mcap = r["current_mcap"]
-                        t.status = r["status"]
+                        t = TrackedToken(
+                            r.get("mint", ""), r.get("name", "?"), r.get("symbol", "?"),
+                            r.get("entry_mcap", 0), r.get("entry_score", 0), r.get("narrative", "?"))
+                        t.peak_x = r.get("peak_x", 1.0)
+                        t.current_mcap = r.get("current_mcap", 0)
+                        t.status = r.get("status", "closed")
                         all_t.append(t)
                     except Exception:
                         continue
@@ -896,26 +901,35 @@ async def handle_commands():
                 await send_tg("📊 No data yet. Wait for some alerts!", cid)
                 return
             
-            outcomes = {"success": [], "moderate": [], "rugged": [], "no_pump": [], "active": []}
-            for t in all_t:
-                outcomes[t.classify_outcome()].append(t)
-            
             total = len(all_t)
+            outcomes = {"success": 0, "moderate": 0, "rugged": 0, "no_pump": 0, "active": 0}
+            top_performers = []
+            
+            for t in all_t:
+                try:
+                    outcome = t.classify_outcome()
+                    outcomes[outcome] = outcomes.get(outcome, 0) + 1
+                    if outcome == "success":
+                        top_performers.append(t)
+                except Exception:
+                    continue
+            
             msg = f"📊 <b>PERFORMANCE ANALYTICS</b>\n\n"
             msg += f"<b>Total:</b> {total}\n\n"
-            msg += f"✅ ≥5X: {len(outcomes['success'])} ({len(outcomes['success'])/total*100:.0f}%)\n"
-            msg += f"⚠️ 2-5X: {len(outcomes['moderate'])} ({len(outcomes['moderate'])/total*100:.0f}%)\n"
-            msg += f"💀 Rugged: {len(outcomes['rugged'])} ({len(outcomes['rugged'])/total*100:.0f}%)\n"
-            msg += f"📉 <2X: {len(outcomes['no_pump'])} ({len(outcomes['no_pump'])/total*100:.0f}%)\n"
-            msg += f"⏳ Active: {len(outcomes['active'])}\n"
+            msg += f"✅ ≥5X: {outcomes['success']} ({outcomes['success']/total*100:.0f}%)\n"
+            msg += f"⚠️ 2-5X: {outcomes['moderate']} ({outcomes['moderate']/total*100:.0f}%)\n"
+            msg += f"💀 Rugged: {outcomes['rugged']} ({outcomes['rugged']/total*100:.0f}%)\n"
+            msg += f"📉 <2X: {outcomes['no_pump']} ({outcomes['no_pump']/total*100:.0f}%)\n"
+            msg += f"⏳ Active: {outcomes['active']}\n"
             
-            if outcomes["success"]:
+            if top_performers:
                 msg += "\n<b>🔥 Top:</b>\n"
-                for t in sorted(outcomes["success"], key=lambda t: t.peak_x, reverse=True)[:3]:
+                for t in sorted(top_performers, key=lambda t: t.peak_x, reverse=True)[:3]:
                     msg += f"  {t.name} — {t.peak_x:.1f}X\n"
             
             await send_tg(msg, cid)
         except Exception as e:
+            log.error(f"[ANALYTICS] {e}")
             await send_tg(f"⚠️ Analytics error: {e}", cid)
 
     commands = {
@@ -944,10 +958,14 @@ async def handle_commands():
                 if not text.startswith("/"): continue
                 cmd = text.split()[0].lower().split('@')[0]
                 log.info(f"[CMD] {cmd}")
-                if cmd in commands:
-                    await commands[cmd](cid)
-                else:
-                    await send_tg(f"❓ Unknown: {cmd}\nTry /help", cid)
+                try:
+                    if cmd in commands:
+                        await commands[cmd](cid)
+                    else:
+                        await send_tg(f"❓ Unknown: {cmd}\nTry /help", cid)
+                except Exception as cmd_err:
+                    log.error(f"[CMD] Error in {cmd}: {cmd_err}")
+                    await send_tg(f"⚠️ Error running {cmd}: {cmd_err}", cid)
         except Exception as e:
             log.error(f"[CMD] {e}")
             await asyncio.sleep(5)
@@ -1026,6 +1044,12 @@ async def handle_token(msg: dict):
     dev_pct = token.get("dev_holds_pct", 0)
     if dev_pct > MAX_DEV_HOLDS_PCT:
         log.info(f"  -> Dev holds {dev_pct:.1f}% > {MAX_DEV_HOLDS_PCT}% — skip")
+        return
+
+    # ── Top 10 holder filter ─────────────────────────────────────────────────
+    top10 = token.get("top10_pct", 25.0)
+    if top10 > 30:
+        log.info(f"  -> Top10 holds {top10:.1f}% > 30% — skip")
         return
 
     # ── Score ────────────────────────────────────────────────────────────────
