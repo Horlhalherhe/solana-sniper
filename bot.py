@@ -1221,14 +1221,20 @@ async def _process_token(msg: dict):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# WEBSOCKET LOOP
+# WEBSOCKET LOOP (FIXED: increased ping_timeout to prevent disconnects)
 # ═══════════════════════════════════════════════════════════════════════════════
 async def ws_loop():
     delay = 5
     while True:
         try:
             log.info("[WS] Connecting to Pump.fun...")
-            async with websockets.connect(PUMP_WS_URL, ping_interval=20, ping_timeout=10, close_timeout=5) as ws:
+            async with websockets.connect(
+                PUMP_WS_URL,
+                ping_interval=30,    # send pings every 30s (was 20)
+                ping_timeout=60,     # wait 60s for pong response (was 10)
+                close_timeout=10,    # allow 10s for clean close (was 5)
+                max_size=2**20,      # 1MB max message size
+            ) as ws:
                 await ws.send(json.dumps({"method": "subscribeNewToken"}))
                 log.info("[WS] Subscribed")
                 delay = 5
