@@ -1072,7 +1072,14 @@ async def check_copycat(symbol: str, name: str, new_mint: str) -> bool:
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN TOKEN HANDLER
 # ═══════════════════════════════════════════════════════════════════════════════
+# Limit concurrent token processing (all tokens enter pipeline now)
+_token_semaphore = asyncio.Semaphore(20)
+
 async def handle_token(msg: dict):
+    async with _token_semaphore:
+        await _process_token(msg)
+
+async def _process_token(msg: dict):
     global total_alerts_fired
 
     if msg.get("txType") != "create":
@@ -1089,13 +1096,12 @@ async def handle_token(msg: dict):
 
     log.info(f"[NEW] {name} (${symbol}) {mint[:12]}...")
 
-    # ── Narrative match ──────────────────────────────────────────────────────
+    # ── Narrative match (optional — boosts score but not required) ──────────
     narrative = match_narrative(name, symbol, desc)
     if narrative["matched"]:
         log.info(f"  -> ✓ Narrative: {narrative['keyword']} [{narrative['category']}]")
     else:
-        log.info(f"  -> No narrative match — skip")
-        return  # REQUIRE narrative match for alerts
+        log.info(f"  -> No narrative match (continuing to filters)")
 
     # ── Blacklist ────────────────────────────────────────────────────────────
     combined = f"{name} {symbol}".lower()
@@ -1104,22 +1110,48 @@ async def handle_token(msg: dict):
             log.info(f"  -> Blacklisted '{bl}' — skip")
             return
 
-    # ── Copycat filter — skip if established token with same symbol/name exists ──
-    is_copy = await check_copycat(symbol, name, mint)
-    if is_copy:
-        log.info(f"  -> ❌ Copycat of existing token — skip (PVP trap)")
-        return
-
     # ── Wait for data ────────────────────────────────────────────────────────
     await asyncio.sleep(WAIT_SECONDS)
+    
+    # ── Quick DexScreener check first (free, no API key) ─────────────────────
+    # This filters out 95% of dead tokens before using Helius credits
+    dex = await fetch_dexscreener(mint)
+    dex_mcap = dex.get("mcap_usd", 0)
+    dex_liq = dex.get("liquidity_usd", 0)
+    
+    if dex_mcap < MIN_MCAP and dex_liq < 2000:
+        # No traction — try Birdeye as backup
+        if BIRDEYE_API_KEY:
+            try:
+                async with httpx.AsyncClient(timeout=8) as client:
+                    resp = await client.get(
+                        "https://public-api.birdeye.so/defi/token_overview",
+                        params={"address": mint},
+                        headers={"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana"})
+                    if resp.status_code == 200:
+                        d = resp.json().get("data") or {}
+                        be_liq = float(d.get("liquidity") or 0)
+                        be_mc = float(d.get("mc") or 0)
+                        if be_mc >= MIN_MCAP or be_liq >= 2000:
+                            pass  # Has traction on Birdeye, continue
+                        else:
+                            log.info(f"  -> No traction (mcap=${be_mc:,.0f} liq=${be_liq:,.0f}) — skip")
+                            return
+                    else:
+                        log.info(f"  -> No traction (DexScreener mcap=${dex_mcap:,.0f}) — skip")
+                        return
+            except Exception:
+                log.info(f"  -> No traction (DexScreener mcap=${dex_mcap:,.0f}) — skip")
+                return
+        else:
+            log.info(f"  -> No traction (mcap=${dex_mcap:,.0f} liq=${dex_liq:,.0f}) — skip")
+            return
+
+    log.info(f"  -> Token has traction — enriching with full data")
+
+    # ── Full enrichment (Helius + Birdeye/DexScreener) ────────────────────────
     token, source = await enrich_token(mint, name, symbol, deployer)
     token["description"] = desc
-
-    if source == "none":
-        log.info(f"  -> Retrying in 45s...")
-        await asyncio.sleep(45)
-        token, source = await enrich_token(mint, name, symbol, deployer)
-        token["description"] = desc
 
     if source == "none":
         log.info(f"  -> No data — skip")
@@ -1128,6 +1160,12 @@ async def handle_token(msg: dict):
     liq = token["liquidity_usd"]
     mcap = token["mcap_usd"]
     log.info(f"  -> Source: {source}  liq=${liq:,.0f}  mcap=${mcap:,.0f}")
+
+    # ── Copycat filter (only for tokens that passed traction check) ──────────
+    is_copy = await check_copycat(symbol, name, mint)
+    if is_copy:
+        log.info(f"  -> ❌ Copycat of existing token — skip (PVP trap)")
+        return
 
     # ── Quality gate ─────────────────────────────────────────────────────────
     # Accept if: real LP >= $3k, OR bonding curve mcap >= $2k, OR Birdeye BC reserve >= $2k
