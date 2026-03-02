@@ -1114,12 +1114,13 @@ async def _process_token(msg: dict):
     await asyncio.sleep(WAIT_SECONDS)
     
     # ── Quick DexScreener check first (free, no API key) ─────────────────────
-    # This filters out 95% of dead tokens before using Helius credits
+    # Low bar: just checking "is anyone buying this?" — quality gate comes later
+    TRACTION_MCAP = 3000  # Just above bonding curve base (~$2,400)
     dex = await fetch_dexscreener(mint)
     dex_mcap = dex.get("mcap_usd", 0)
     dex_liq = dex.get("liquidity_usd", 0)
     
-    if dex_mcap < MIN_MCAP and dex_liq < 2000:
+    if dex_mcap < TRACTION_MCAP and dex_liq < 2000:
         # No traction — try Birdeye as backup
         if BIRDEYE_API_KEY:
             try:
@@ -1132,7 +1133,7 @@ async def _process_token(msg: dict):
                         d = resp.json().get("data") or {}
                         be_liq = float(d.get("liquidity") or 0)
                         be_mc = float(d.get("mc") or 0)
-                        if be_mc >= MIN_MCAP or be_liq >= 2000:
+                        if be_mc >= TRACTION_MCAP or be_liq >= 2000:
                             pass  # Has traction on Birdeye, continue
                         else:
                             log.info(f"  -> No traction (mcap=${be_mc:,.0f} liq=${be_liq:,.0f}) — skip")
@@ -1188,13 +1189,25 @@ async def _process_token(msg: dict):
         return
 
     # ── Top 10 holder filter ─────────────────────────────────────────────────
+    # Scale limit by holder count: early tokens (few holders) = higher top10 is normal
     top10 = token.get("top10_pct", 25.0)
-    if top10 > 30:
-        log.info(f"  -> Top10 holds {top10:.1f}% > 30% — skip")
+    holders = token.get("total_holders", 50)
+    
+    if holders >= 100:
+        top10_limit = 30    # 100+ holders: top10 should be < 30%
+    elif holders >= 50:
+        top10_limit = 45    # 50-99 holders: top10 < 45% is fine
+    elif holders >= 20:
+        top10_limit = 60    # 20-49 holders: top10 < 60% is normal
+    else:
+        top10_limit = 80    # <20 holders: almost anything goes, too early to judge
+    
+    if top10 > top10_limit:
+        log.info(f"  -> Top10 holds {top10:.1f}% > {top10_limit}% ({holders} holders) — skip")
         return
 
     # ── Score ────────────────────────────────────────────────────────────────
-    log.info(f"  -> ✅ PASSED FILTERS — dev={dev_pct:.1f}% top10={top10:.1f}% — scoring")
+    log.info(f"  -> ✅ PASSED FILTERS — dev={dev_pct:.1f}% top10={top10:.1f}% ({holders}h) — scoring")
     result = score_token(token, narrative)
     score = result["final_score"]
     log.info(f"  -> Score: {score}/10  {result['verdict']}")
@@ -1221,20 +1234,14 @@ async def _process_token(msg: dict):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# WEBSOCKET LOOP (FIXED: increased ping_timeout to prevent disconnects)
+# WEBSOCKET LOOP
 # ═══════════════════════════════════════════════════════════════════════════════
 async def ws_loop():
     delay = 5
     while True:
         try:
             log.info("[WS] Connecting to Pump.fun...")
-            async with websockets.connect(
-                PUMP_WS_URL,
-                ping_interval=30,    # send pings every 30s (was 20)
-                ping_timeout=60,     # wait 60s for pong response (was 10)
-                close_timeout=10,    # allow 10s for clean close (was 5)
-                max_size=2**20,      # 1MB max message size
-            ) as ws:
+            async with websockets.connect(PUMP_WS_URL, ping_interval=20, ping_timeout=10, close_timeout=5) as ws:
                 await ws.send(json.dumps({"method": "subscribeNewToken"}))
                 log.info("[WS] Subscribed")
                 delay = 5
