@@ -195,10 +195,6 @@ _build_patterns()
 
 
 def match_narrative(name: str, symbol: str, description: str = "") -> dict:
-    """
-    Match a token against all narrative keywords using word boundaries.
-    Returns the best match with category and score.
-    """
     combined = f"{name} {symbol} {description}".lower()
     
     best_kw = None
@@ -207,13 +203,11 @@ def match_narrative(name: str, symbol: str, description: str = "") -> dict:
     
     for kw, (cat, pattern) in _KW_PATTERNS.items():
         if pattern.search(combined):
-            # Higher confidence if match is in name or symbol directly
             if pattern.search(name.lower()) or pattern.search(symbol.lower()):
                 conf = 0.95
             else:
                 conf = 0.65
             
-            # Prefer longer keyword matches (more specific)
             specificity = len(kw) * conf
             if specificity > (len(best_kw) * best_confidence if best_kw else 0):
                 best_kw = kw
@@ -235,15 +229,6 @@ def match_narrative(name: str, symbol: str, description: str = "") -> dict:
 # SIMPLE SCORER — designed for pump.fun bonding curve tokens
 # ═══════════════════════════════════════════════════════════════════════════════
 def score_token(token: dict, narrative: dict) -> dict:
-    """
-    Simple 1-10 scoring for pump.fun tokens.
-    
-    Components (weighted):
-      narrative  30%  — matched keyword + confidence
-      momentum   30%  — volume, buys vs sells, price action
-      timing     20%  — fresh tokens score higher
-      safety     20%  — dev holds, basic checks
-    """
     scores = {}
     signals = []
     warnings = []
@@ -254,7 +239,7 @@ def score_token(token: dict, narrative: dict) -> dict:
         if narrative["confidence"] >= 0.9:
             base = 8.5
         scores["narrative"] = base
-        signals.append(f"📡 Narrative: {narrative['keyword']} [{narrative['category']}]")
+        signals.append(f"Narrative: {narrative['keyword']} [{narrative['category']}]")
     else:
         scores["narrative"] = 2.0
     
@@ -275,32 +260,31 @@ def score_token(token: dict, narrative: dict) -> dict:
     elif buy_ratio > 1.5:   mom += 0.5
     elif buy_ratio < 0.5:   mom -= 2.0
     
-    # MCap traction (bonding curve showing buying)
     if mcap > 10_000:       mom += 1.0
     elif mcap > 5_000:      mom += 0.5
     
     scores["momentum"] = max(min(mom, 10.0), 1.0)
     
     if vol_1h > 10_000:
-        signals.append(f"📈 Volume: ${vol_1h:,.0f}/1h")
+        signals.append(f"Volume: ${vol_1h:,.0f}/1h")
     if buy_ratio > 2.0:
-        signals.append(f"🟢 Buy pressure: {buy_ratio:.1f}x")
+        signals.append(f"Buy pressure: {buy_ratio:.1f}x")
     if vol_1h < 1_000:
         warnings.append(f"Low volume: ${vol_1h:,.0f}/1h")
     
     # ── Timing (20%) ─────────────────────────────────────────────────────────
     age_h = token.get("age_hours", 0.5)
-    if age_h < 0.1:         tim = 6.0   # Very early, risky but fresh
-    elif age_h < 0.5:       tim = 8.5   # Sweet spot
-    elif age_h < 2:         tim = 7.5   # Still good
-    elif age_h < 6:         tim = 5.0   # OK
-    elif age_h < 24:        tim = 3.0   # Getting old
+    if age_h < 0.1:         tim = 6.0
+    elif age_h < 0.5:       tim = 8.5
+    elif age_h < 2:         tim = 7.5
+    elif age_h < 6:         tim = 5.0
+    elif age_h < 24:        tim = 3.0
     else:                   tim = 2.0
     
     scores["timing"] = tim
     
     if 0.1 <= age_h <= 2:
-        signals.append(f"⏱ Sweet spot timing ({age_h:.1f}h)")
+        signals.append(f"Sweet spot timing ({age_h:.1f}h)")
     if age_h > 12:
         warnings.append(f"Late entry: {age_h:.0f}h old")
     
@@ -309,15 +293,14 @@ def score_token(token: dict, narrative: dict) -> dict:
     mint_revoked = token.get("mint_authority_revoked", True)
     freeze_revoked = token.get("freeze_authority_revoked", True)
     
-    safe = 6.0  # Neutral baseline for pump.fun
+    safe = 6.0
     
     if dev_pct > 5.0:       safe -= 2.0
     elif dev_pct > 2.0:     safe -= 0.5
     elif dev_pct <= 1.0:    safe += 1.0
     
-    # Only penalize mint/freeze on migrated tokens (not bonding curve)
     liq = token.get("liquidity_usd", 0)
-    if liq > 10_000:  # Migrated token — should have revoked
+    if liq > 10_000:
         if not mint_revoked:    safe -= 2.0
         if not freeze_revoked:  safe -= 1.5
     
@@ -326,18 +309,18 @@ def score_token(token: dict, narrative: dict) -> dict:
     if dev_pct > 3.0:
         warnings.append(f"Dev holds: {dev_pct:.1f}%")
     if dev_pct <= 1.0 and dev_pct >= 0:
-        signals.append(f"✅ Dev holds {dev_pct:.1f}%")
+        signals.append(f"Dev holds {dev_pct:.1f}%")
     
     # ── Final Score ──────────────────────────────────────────────────────────
     weights = {"narrative": 0.30, "momentum": 0.30, "timing": 0.20, "safety": 0.20}
     final = sum(scores[k] * weights[k] for k in weights)
     final = round(max(min(final, 10.0), 1.0), 2)
     
-    if final >= 7.5:    verdict = "🟢 STRONG ENTRY"
-    elif final >= 6.0:  verdict = "🟡 GOOD ENTRY"
-    elif final >= 5.0:  verdict = "🟠 WEAK ENTRY"
-    elif final >= 3.5:  verdict = "🔴 HIGH RISK"
-    else:               verdict = "⛔ AVOID"
+    if final >= 7.5:    verdict = "STRONG ENTRY"
+    elif final >= 6.0:  verdict = "GOOD ENTRY"
+    elif final >= 5.0:  verdict = "WEAK ENTRY"
+    elif final >= 3.5:  verdict = "HIGH RISK"
+    else:               verdict = "AVOID"
     
     return {
         "final_score": final,
@@ -400,7 +383,7 @@ tracked: Dict[str, TrackedToken] = {}
 leaderboard_history: List[dict] = []
 bot_start_time: datetime = utcnow()
 total_alerts_fired: int = 0
-active_narratives: dict = {}  # For /narratives command
+active_narratives: dict = {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -568,7 +551,6 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> Tupl
                                 if top_resp.status_code == 200:
                                     accounts = top_resp.json().get("result", {}).get("value", [])
                                     if accounts:
-                                        # Calculate top1 and top10 percentages
                                         amounts = []
                                         for acc in accounts[:20]:
                                             amt_str = acc.get("amount", "0")
@@ -1005,19 +987,13 @@ async def handle_commands():
 # ═══════════════════════════════════════════════════════════════════════════════
 # COPYCAT DETECTION — skip PVP copies of existing tokens
 # ═══════════════════════════════════════════════════════════════════════════════
-COPYCAT_MIN_MCAP = float(os.getenv("COPYCAT_MIN_MCAP", "50000"))  # Existing token must have this mcap to count
+COPYCAT_MIN_MCAP = float(os.getenv("COPYCAT_MIN_MCAP", "50000"))
 
 async def check_copycat(symbol: str, name: str, new_mint: str) -> bool:
-    """
-    Search DexScreener for existing tokens with the same symbol or name.
-    If one already exists with real mcap (>$50k), this new token is a PVP copy.
-    """
     if not symbol or len(symbol) < 2:
         return False
     
-    # Search by symbol first, then by name if different
     search_terms = [symbol]
-    # Clean name: take first meaningful word (skip "The", "Baby", etc.)
     name_clean = name.strip().split()[0] if name else ""
     if name_clean.lower() not in [symbol.lower(), "the", "baby", "king", "queen", "sir", "mr", "ms", "dr", "new"]:
         if len(name_clean) >= 3:
@@ -1036,25 +1012,22 @@ async def check_copycat(symbol: str, name: str, new_mint: str) -> bool:
                 for pair in pairs:
                     base_token = pair.get("baseToken") or {}
                     
-                    # Skip if same token
                     if base_token.get("address", "") == new_mint:
                         continue
                     
-                    # Must be Solana
                     if pair.get("chainId", "") != "solana":
                         continue
                     
-                    # Check symbol or name match
                     existing_sym = base_token.get("symbol", "").upper()
                     existing_name = base_token.get("name", "").lower()
                     
+                    # Only match on symbol, not name — name matching causes too many false positives
+                    # e.g. "Leo" the dog matching "Bitfinex LEO Token"
                     sym_match = (existing_sym == symbol.upper())
-                    name_match = (name.lower() in existing_name or existing_name in name.lower()) and len(existing_name) >= 3
                     
-                    if not sym_match and not name_match:
+                    if not sym_match:
                         continue
                     
-                    # Check mcap
                     existing_mcap = float(pair.get("marketCap") or pair.get("fdv") or 0)
                     existing_liq = float((pair.get("liquidity") or {}).get("usd") or 0)
                     
@@ -1062,7 +1035,7 @@ async def check_copycat(symbol: str, name: str, new_mint: str) -> bool:
                         log.info(f"  -> Found existing: {base_token.get('name','?')} (${existing_sym}) mcap=${existing_mcap:,.0f} liq=${existing_liq:,.0f}")
                         return True
                 
-                await asyncio.sleep(0.2)  # Rate limit between searches
+                await asyncio.sleep(0.2)
     except Exception as e:
         log.warning(f"[Copycat] Check failed: {e}")
     
@@ -1072,7 +1045,6 @@ async def check_copycat(symbol: str, name: str, new_mint: str) -> bool:
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN TOKEN HANDLER
 # ═══════════════════════════════════════════════════════════════════════════════
-# Limit concurrent token processing (all tokens enter pipeline now)
 _token_semaphore = asyncio.Semaphore(20)
 
 async def handle_token(msg: dict):
@@ -1169,10 +1141,9 @@ async def _process_token(msg: dict):
         return
 
     # ── Quality gate ─────────────────────────────────────────────────────────
-    # Accept if: real LP >= $3k, OR bonding curve mcap >= $2k, OR Birdeye BC reserve >= $2k
     has_lp = liq >= 3000
     has_mcap = mcap >= MIN_MCAP
-    is_bc_with_reserve = (liq >= 2000 and mcap == 0)  # Birdeye BC reporting
+    is_bc_with_reserve = (liq >= 2000 and mcap == 0)
     
     if not (has_lp or has_mcap or is_bc_with_reserve):
         log.info(f"  -> LP ${liq:,.0f} & MCap ${mcap:,.0f} too low — skip")
@@ -1189,22 +1160,26 @@ async def _process_token(msg: dict):
         return
 
     # ── Top 10 holder filter ─────────────────────────────────────────────────
-    # Scale limit by holder count: early tokens (few holders) = higher top10 is normal
+    # ONLY apply to migrated tokens with real liquidity. On bonding curve (liq=0),
+    # getTokenLargestAccounts includes the bonding curve contract itself which
+    # holds 50-80% of supply. That's the AMM pool, not a whale.
     top10 = token.get("top10_pct", 25.0)
     holders = token.get("total_holders", 50)
     
-    if holders >= 100:
-        top10_limit = 30    # 100+ holders: top10 should be < 30%
-    elif holders >= 50:
-        top10_limit = 45    # 50-99 holders: top10 < 45% is fine
-    elif holders >= 20:
-        top10_limit = 60    # 20-49 holders: top10 < 60% is normal
+    if liq > 0:
+        # Migrated token — top10 data is meaningful
+        if holders >= 100:
+            top10_limit = 30
+        elif holders >= 50:
+            top10_limit = 45
+        else:
+            top10_limit = 60
+        
+        if top10 > top10_limit:
+            log.info(f"  -> Top10 holds {top10:.1f}% > {top10_limit}% ({holders} holders) — skip")
+            return
     else:
-        top10_limit = 80    # <20 holders: almost anything goes, too early to judge
-    
-    if top10 > top10_limit:
-        log.info(f"  -> Top10 holds {top10:.1f}% > {top10_limit}% ({holders} holders) — skip")
-        return
+        log.info(f"  -> Bonding curve — top10 filter skipped (BC inflates holder data)")
 
     # ── Score ────────────────────────────────────────────────────────────────
     log.info(f"  -> ✅ PASSED FILTERS — dev={dev_pct:.1f}% top10={top10:.1f}% ({holders}h) — scoring")
@@ -1220,7 +1195,7 @@ async def _process_token(msg: dict):
         await send_tg(format_alert(token, result, narrative))
 
         # Track
-        entry_mcap = mcap if mcap > 0 else liq  # Use LP as proxy for BC tokens
+        entry_mcap = mcap if mcap > 0 else liq
         if entry_mcap > 0:
             async with tracked_lock:
                 tracked[mint] = TrackedToken(
@@ -1241,7 +1216,13 @@ async def ws_loop():
     while True:
         try:
             log.info("[WS] Connecting to Pump.fun...")
-            async with websockets.connect(PUMP_WS_URL, ping_interval=20, ping_timeout=10, close_timeout=5) as ws:
+            async with websockets.connect(
+                PUMP_WS_URL,
+                ping_interval=30,
+                ping_timeout=60,
+                close_timeout=10,
+                max_size=2**20,
+            ) as ws:
                 await ws.send(json.dumps({"method": "subscribeNewToken"}))
                 log.info("[WS] Subscribed")
                 delay = 5
