@@ -233,7 +233,7 @@ def score_token(token: dict, narrative: dict) -> dict:
     signals = []
     warnings = []
     
-    # ── Narrative (30%) ──────────────────────────────────────────────────────
+    # ── Narrative (15%) — bonus, not required ──────────────────────────────
     if narrative["matched"]:
         base = 7.0
         if narrative["confidence"] >= 0.9:
@@ -241,9 +241,9 @@ def score_token(token: dict, narrative: dict) -> dict:
         scores["narrative"] = base
         signals.append(f"Narrative: {narrative['keyword']} [{narrative['category']}]")
     else:
-        scores["narrative"] = 2.0
+        scores["narrative"] = 5.0  # Neutral — no penalty for missing narrative
     
-    # ── Momentum (30%) ───────────────────────────────────────────────────────
+    # ── Momentum (40%) — the real signal ─────────────────────────────────────
     vol_1h = token.get("volume_1h_usd", 0)
     buy_ratio = token.get("buy_sell_ratio_1h", 1.0)
     mcap = token.get("mcap_usd", 0)
@@ -253,15 +253,23 @@ def score_token(token: dict, narrative: dict) -> dict:
     elif vol_1h > 50_000:   mom += 2.0
     elif vol_1h > 10_000:   mom += 1.0
     elif vol_1h > 5_000:    mom += 0.5
-    elif vol_1h < 500:      mom -= 1.5
+    elif vol_1h < 500:      mom -= 1.0
     
     if buy_ratio > 3.0:     mom += 1.5
     elif buy_ratio > 2.0:   mom += 1.0
     elif buy_ratio > 1.5:   mom += 0.5
     elif buy_ratio < 0.5:   mom -= 2.0
     
-    if mcap > 10_000:       mom += 1.0
+    # MCap traction — on bonding curve, higher mcap = real buying pressure
+    if mcap > 30_000:       mom += 2.0
+    elif mcap > 15_000:     mom += 1.5
+    elif mcap > 10_000:     mom += 1.0
     elif mcap > 5_000:      mom += 0.5
+    
+    # Holder count — organic interest signal
+    holders = token.get("total_holders", 0)
+    if holders > 100:       mom += 1.0
+    elif holders > 50:      mom += 0.5
     
     scores["momentum"] = max(min(mom, 10.0), 1.0)
     
@@ -269,6 +277,8 @@ def score_token(token: dict, narrative: dict) -> dict:
         signals.append(f"Volume: ${vol_1h:,.0f}/1h")
     if buy_ratio > 2.0:
         signals.append(f"Buy pressure: {buy_ratio:.1f}x")
+    if mcap > 10_000:
+        signals.append(f"MCap traction: ${mcap:,.0f}")
     if vol_1h < 1_000:
         warnings.append(f"Low volume: ${vol_1h:,.0f}/1h")
     
@@ -297,6 +307,7 @@ def score_token(token: dict, narrative: dict) -> dict:
     
     if dev_pct > 5.0:       safe -= 2.0
     elif dev_pct > 2.0:     safe -= 0.5
+    elif dev_pct <= 0.5:    safe += 2.0   # Dev holds almost nothing — great
     elif dev_pct <= 1.0:    safe += 1.0
     
     liq = token.get("liquidity_usd", 0)
@@ -312,7 +323,7 @@ def score_token(token: dict, narrative: dict) -> dict:
         signals.append(f"Dev holds {dev_pct:.1f}%")
     
     # ── Final Score ──────────────────────────────────────────────────────────
-    weights = {"narrative": 0.30, "momentum": 0.30, "timing": 0.20, "safety": 0.20}
+    weights = {"narrative": 0.15, "momentum": 0.40, "timing": 0.20, "safety": 0.25}
     final = sum(scores[k] * weights[k] for k in weights)
     final = round(max(min(final, 10.0), 1.0), 2)
     
@@ -648,7 +659,7 @@ def format_alert(token: dict, score: dict, narrative: dict) -> str:
         f"<b>{token.get('name','?')}</b>  <code>${token.get('symbol','?')}</code>",
         f"<code>{mint}</code>", "",
         f"📊 <b>SCORE: {score['final_score']}/10</b>  {score['verdict']}",
-        f"<i>weights: narrative 30% | momentum 30% | timing 20% | safety 20%</i>", "",
+        f"<i>weights: narrative 15% | momentum 40% | timing 20% | safety 25%</i>", "",
     ]
     
     if narrative["matched"]:
