@@ -367,12 +367,12 @@ class TrackedToken:
         return round(self.current_mcap / max(self.entry_mcap, 1), 2)
     
     def classify_outcome(self):
-        x = self.current_x()
+        if self.status == "active":
+            return "active"
         if self.peak_x >= 5.0:       return "success"
-        elif x < 0.5 and self.status == "closed": return "rugged"
         elif self.peak_x >= 2.0:     return "moderate"
-        elif self.peak_x < 2.0:      return "no_pump"
-        else:                         return "active"
+        elif self.peak_x < 0.5:      return "rugged"
+        else:                         return "no_pump"
 
     def to_record(self):
         return {
@@ -569,13 +569,32 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> Tupl
                                             amounts.append(ui_amt)
                                         
                                         if amounts and supply > 0:
-                                            top1_pct = (amounts[0] / supply) * 100
-                                            top10_sum = sum(amounts[:10])
-                                            top10_pct = (top10_sum / supply) * 100
+                                            # Check if largest holder is bonding curve (>40% of supply)
+                                            # On BC tokens, the AMM pool holds unsold tokens
+                                            top1_raw_pct = (amounts[0] / supply) * 100
+                                            
+                                            if top1_raw_pct > 40:
+                                                # Likely bonding curve — exclude it from stats
+                                                real_amounts = amounts[1:]  # Skip BC contract
+                                                if real_amounts:
+                                                    top1_pct = (real_amounts[0] / supply) * 100
+                                                    top10_sum = sum(real_amounts[:10])
+                                                    top10_pct = (top10_sum / supply) * 100
+                                                else:
+                                                    top1_pct = 0.0
+                                                    top10_pct = 0.0
+                                                base["total_holders"] = max(len(accounts) - 1, 1)
+                                                log.info(f"  -> Holders (excl BC): top1={top1_pct:.1f}% top10={top10_pct:.1f}% ({len(accounts)-1} real)")
+                                            else:
+                                                # No BC detected — normal calculation
+                                                top1_pct = top1_raw_pct
+                                                top10_sum = sum(amounts[:10])
+                                                top10_pct = (top10_sum / supply) * 100
+                                                base["total_holders"] = max(len(accounts), base["total_holders"])
+                                                log.info(f"  -> Holders: top1={top1_pct:.1f}% top10={top10_pct:.1f}% ({len(accounts)} accounts)")
+                                            
                                             base["top1_pct"] = round(top1_pct, 1)
                                             base["top10_pct"] = round(top10_pct, 1)
-                                            base["total_holders"] = max(len(accounts), base["total_holders"])
-                                            log.info(f"  -> Holders: top1={top1_pct:.1f}% top10={top10_pct:.1f}% ({len(accounts)} accounts)")
                             except Exception as e:
                                 log.warning(f"[Helius] Top holders: {e}")
         except Exception as e:
@@ -611,11 +630,27 @@ async def enrich_token(mint: str, name: str, symbol: str, deployer: str) -> Tupl
         except Exception as e:
             log.warning(f"[Birdeye] {e}")
 
-    # DexScreener fallback
+    # DexScreener fallback — preserve Helius holder data
     if source == "none":
         dex = await fetch_dexscreener(mint)
         if dex.get("mcap_usd", 0) > 0 or dex.get("liquidity_usd", 0) > 0:
+            # Save Helius holder data before DexScreener overwrites
+            helius_holders = base.get("total_holders", 50)
+            helius_top1 = base.get("top1_pct", 5.0)
+            helius_top10 = base.get("top10_pct", 25.0)
+            helius_dev = base.get("dev_holds_pct", 0.0)
+            
             base.update(dex)
+            
+            # Restore Helius data (more accurate than DexScreener defaults)
+            if helius_holders != 50:  # Only restore if Helius gave real data
+                base["total_holders"] = helius_holders
+            if helius_top1 != 5.0:
+                base["top1_pct"] = helius_top1
+            if helius_top10 != 25.0:
+                base["top10_pct"] = helius_top10
+            base["dev_holds_pct"] = helius_dev  # Always keep Helius dev data
+            
             source = "dexscreener"
             log.info(f"  -> DexScreener: liq=${base['liquidity_usd']:,.0f} mcap=${base['mcap_usd']:,.0f}")
 
@@ -902,23 +937,38 @@ async def handle_commands():
         await send_tg(format_leaderboard(records, name), cid)
 
     async def send_analytics(cid):
+        log.info("[ANALYTICS] Command received")
         try:
             all_t = []
-            async with tracked_lock:
-                for t in tracked.values():
+            
+            # Grab data — use snapshots to avoid holding locks
+            try:
+                async with tracked_lock:
+                    tracked_snap = list(tracked.values())
+                all_t.extend(tracked_snap)
+            except Exception as e:
+                log.warning(f"[ANALYTICS] Tracked lock issue: {e}")
+            
+            try:
+                async with history_lock:
+                    history_snap = list(leaderboard_history)
+            except Exception as e:
+                log.warning(f"[ANALYTICS] History lock issue: {e}")
+                history_snap = []
+            
+            for r in history_snap:
+                try:
+                    t = TrackedToken(
+                        r.get("mint", ""), r.get("name", "?"), r.get("symbol", "?"),
+                        r.get("entry_mcap", 0), r.get("entry_score", 0), r.get("narrative", "?"))
+                    t.peak_x = r.get("peak_x", 1.0)
+                    t.current_mcap = r.get("current_mcap", 0)
+                    t.status = r.get("status", "closed")
                     all_t.append(t)
-            async with history_lock:
-                for r in leaderboard_history:
-                    try:
-                        t = TrackedToken(
-                            r.get("mint", ""), r.get("name", "?"), r.get("symbol", "?"),
-                            r.get("entry_mcap", 0), r.get("entry_score", 0), r.get("narrative", "?"))
-                        t.peak_x = r.get("peak_x", 1.0)
-                        t.current_mcap = r.get("current_mcap", 0)
-                        t.status = r.get("status", "closed")
-                        all_t.append(t)
-                    except Exception:
-                        continue
+                except Exception:
+                    continue
+            
+            log.info(f"[ANALYTICS] Found {len(all_t)} tokens")
             
             if not all_t:
                 await send_tg("📊 No data yet. Wait for some alerts!", cid)
@@ -951,9 +1001,13 @@ async def handle_commands():
                     msg += f"  {t.name} — {t.peak_x:.1f}X\n"
             
             await send_tg(msg, cid)
+            log.info("[ANALYTICS] Sent successfully")
         except Exception as e:
             log.error(f"[ANALYTICS] {e}")
-            await send_tg(f"⚠️ Analytics error: {e}", cid)
+            try:
+                await send_tg(f"⚠️ Analytics error: {e}", cid)
+            except Exception:
+                pass
 
     commands = {
         '/status':      lambda cid: send_tg(format_status(), cid),
