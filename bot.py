@@ -939,71 +939,80 @@ async def handle_commands():
     async def send_analytics(cid):
         log.info("[ANALYTICS] Command received")
         try:
-            all_t = []
-            
-            # Grab data — use snapshots to avoid holding locks
+            # Step 1: Snapshot data quickly
+            active_list = []
+            history_list = []
             try:
                 async with tracked_lock:
-                    tracked_snap = list(tracked.values())
-                all_t.extend(tracked_snap)
-            except Exception as e:
-                log.warning(f"[ANALYTICS] Tracked lock issue: {e}")
-            
+                    active_list = list(tracked.values())
+            except Exception:
+                pass
             try:
                 async with history_lock:
-                    history_snap = list(leaderboard_history)
-            except Exception as e:
-                log.warning(f"[ANALYTICS] History lock issue: {e}")
-                history_snap = []
+                    history_list = list(leaderboard_history)
+            except Exception:
+                pass
             
-            for r in history_snap:
-                try:
-                    t = TrackedToken(
-                        r.get("mint", ""), r.get("name", "?"), r.get("symbol", "?"),
-                        r.get("entry_mcap", 0), r.get("entry_score", 0), r.get("narrative", "?"))
-                    t.peak_x = r.get("peak_x", 1.0)
-                    t.current_mcap = r.get("current_mcap", 0)
-                    t.status = r.get("status", "closed")
-                    all_t.append(t)
-                except Exception:
-                    continue
+            # Step 2: Count outcomes directly — no method calls
+            total = len(active_list) + len(history_list)
+            log.info(f"[ANALYTICS] {len(active_list)} active + {len(history_list)} history")
             
-            log.info(f"[ANALYTICS] Found {len(all_t)} tokens")
-            
-            if not all_t:
+            if total == 0:
                 await send_tg("📊 No data yet. Wait for some alerts!", cid)
                 return
             
-            total = len(all_t)
-            outcomes = {"success": 0, "moderate": 0, "rugged": 0, "no_pump": 0, "active": 0}
-            top_performers = []
+            success = moderate = rugged = no_pump = active_count = 0
+            top3 = []
             
-            for t in all_t:
+            # Count active tokens
+            for t in active_list:
                 try:
-                    outcome = t.classify_outcome()
-                    outcomes[outcome] = outcomes.get(outcome, 0) + 1
-                    if outcome == "success":
-                        top_performers.append(t)
+                    active_count += 1
+                    px = float(getattr(t, 'peak_x', 1.0))
+                    if px >= 5.0:
+                        top3.append((str(getattr(t, 'name', '?')), px))
                 except Exception:
-                    continue
+                    pass
             
-            msg = f"📊 <b>PERFORMANCE ANALYTICS</b>\n\n"
+            # Count history tokens
+            for r in history_list:
+                try:
+                    px = float(r.get("peak_x", 1.0))
+                    if px >= 5.0:
+                        success += 1
+                        top3.append((str(r.get("name", "?")), px))
+                    elif px >= 2.0:
+                        moderate += 1
+                    elif px < 0.5:
+                        rugged += 1
+                    else:
+                        no_pump += 1
+                except Exception:
+                    no_pump += 1
+            
+            # Step 3: Build message with safe math
+            s_pct = int(success * 100 / total) if total else 0
+            m_pct = int(moderate * 100 / total) if total else 0
+            r_pct = int(rugged * 100 / total) if total else 0
+            n_pct = int(no_pump * 100 / total) if total else 0
+            
+            msg = "📊 <b>PERFORMANCE ANALYTICS</b>\n\n"
             msg += f"<b>Total:</b> {total}\n\n"
-            msg += f"✅ ≥5X: {outcomes['success']} ({outcomes['success']/total*100:.0f}%)\n"
-            msg += f"⚠️ 2-5X: {outcomes['moderate']} ({outcomes['moderate']/total*100:.0f}%)\n"
-            msg += f"💀 Rugged: {outcomes['rugged']} ({outcomes['rugged']/total*100:.0f}%)\n"
-            msg += f"📉 <2X: {outcomes['no_pump']} ({outcomes['no_pump']/total*100:.0f}%)\n"
-            msg += f"⏳ Active: {outcomes['active']}\n"
+            msg += f"✅ 5X+: {success} ({s_pct}%)\n"
+            msg += f"⚠️ 2-5X: {moderate} ({m_pct}%)\n"
+            msg += f"💀 Rugged: {rugged} ({r_pct}%)\n"
+            msg += f"📉 No pump: {no_pump} ({n_pct}%)\n"
+            msg += f"⏳ Active: {active_count}\n"
             
-            if top_performers:
+            if top3:
                 msg += "\n<b>🔥 Top:</b>\n"
-                for t in sorted(top_performers, key=lambda t: t.peak_x, reverse=True)[:3]:
-                    msg += f"  {t.name} — {t.peak_x:.1f}X\n"
+                for tname, tpeak in sorted(top3, key=lambda x: x[1], reverse=True)[:3]:
+                    msg += f"  {tname} — {tpeak:.1f}X\n"
             
             await send_tg(msg, cid)
-            log.info("[ANALYTICS] Sent successfully")
+            log.info("[ANALYTICS] Sent OK")
         except Exception as e:
-            log.error(f"[ANALYTICS] {e}")
+            log.error(f"[ANALYTICS] FAILED: {e}")
             try:
                 await send_tg(f"⚠️ Analytics error: {e}", cid)
             except Exception:
@@ -1293,7 +1302,7 @@ async def ws_loop():
                 delay = 5
                 async for raw in ws:
                     try:
-                        await handle_token(json.loads(raw))
+                        asyncio.create_task(handle_token(json.loads(raw)))
                     except json.JSONDecodeError:
                         pass
                     except Exception as e:
