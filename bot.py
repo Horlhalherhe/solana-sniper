@@ -833,7 +833,10 @@ def format_help() -> str:
         "/monthly      — 30 day leaderboard",
         "/narratives   — keyword categories",
         "/tracking     — live tracked tokens",
-        "/analytics    — performance stats",
+        "/analytics    — full performance report",
+        "/analytics24  — last 24h report",
+        "/analytics7   — last 7 day report",
+        "/analytics30  — last 30 day report",
         "/help         — this menu",
     ])
 
@@ -936,8 +939,8 @@ async def handle_commands():
         name = "24H" if days == 1 else f"{days}D"
         await send_tg(format_leaderboard(records, name), cid)
 
-    async def send_analytics(cid):
-        log.info("[ANALYTICS] Command received")
+    async def send_analytics(cid, days=None):
+        log.info(f"[ANALYTICS] Command received (days={days})")
         try:
             # Step 1: Snapshot data quickly
             active_list = []
@@ -952,64 +955,184 @@ async def handle_commands():
                     history_list = list(leaderboard_history)
             except Exception:
                 pass
-            
-            # Step 2: Count outcomes directly — no method calls
-            total = len(active_list) + len(history_list)
-            log.info(f"[ANALYTICS] {len(active_list)} active + {len(history_list)} history")
-            
-            if total == 0:
-                await send_tg("📊 No data yet. Wait for some alerts!", cid)
-                return
-            
-            success = moderate = rugged = no_pump = active_count = 0
-            top3 = []
-            
-            # Count active tokens
+
+            # Step 2: Build unified list of plain dicts (no object creation)
+            all_items = []
             for t in active_list:
                 try:
-                    active_count += 1
-                    px = float(getattr(t, 'peak_x', 1.0))
-                    if px >= 5.0:
-                        top3.append((str(getattr(t, 'name', '?')), px))
+                    all_items.append({
+                        "name": str(getattr(t, 'name', '?')),
+                        "peak_x": float(getattr(t, 'peak_x', 1.0)),
+                        "entry_score": float(getattr(t, 'entry_score', 0)),
+                        "narrative": str(getattr(t, 'narrative', '?')),
+                        "added_at": getattr(t, 'added_at', utcnow()).isoformat() if hasattr(getattr(t, 'added_at', None), 'isoformat') else "",
+                        "status": "active",
+                    })
                 except Exception:
                     pass
-            
-            # Count history tokens
             for r in history_list:
                 try:
-                    px = float(r.get("peak_x", 1.0))
-                    if px >= 5.0:
+                    all_items.append({
+                        "name": str(r.get("name", "?")),
+                        "peak_x": float(r.get("peak_x", 1.0)),
+                        "entry_score": float(r.get("entry_score", 0)),
+                        "narrative": str(r.get("narrative", "?")),
+                        "added_at": str(r.get("added_at", "")),
+                        "status": str(r.get("status", "closed")),
+                    })
+                except Exception:
+                    continue
+
+            # Step 3: Filter by time period
+            period_label = "ALL TIME"
+            if days:
+                cutoff = utcnow() - timedelta(days=days)
+                filtered = []
+                for item in all_items:
+                    try:
+                        added = datetime.fromisoformat(item["added_at"])
+                        if added >= cutoff:
+                            filtered.append(item)
+                    except Exception:
+                        filtered.append(item)
+                all_items = filtered
+                period_label = "24H" if days == 1 else f"{days}D"
+
+            total = len(all_items)
+            log.info(f"[ANALYTICS] {total} items for {period_label}")
+
+            if total == 0:
+                await send_tg(f"📊 No data for {period_label}.", cid)
+                return
+
+            # Step 4: Classify — all in one pass, plain math only
+            success = moderate = rugged = no_pump = active_count = 0
+            winner_scores = []
+            loser_scores = []
+            b70 = [0, 0]  # [total, winners] for 7.0-7.5
+            b75 = [0, 0]  # 7.5-8.0
+            b80 = [0, 0]  # 8.0+
+            narr_stats = {}
+            best_calls = []
+            worst_calls = []
+
+            for item in all_items:
+                try:
+                    px = item["peak_x"]
+                    sc = item["entry_score"]
+                    narr = item["narrative"]
+                    name = item["name"]
+                    status = item["status"]
+                    is_winner = px >= 2.0
+
+                    # Outcomes
+                    if status == "active":
+                        active_count += 1
+                    elif px >= 5.0:
                         success += 1
-                        top3.append((str(r.get("name", "?")), px))
                     elif px >= 2.0:
                         moderate += 1
                     elif px < 0.5:
                         rugged += 1
                     else:
                         no_pump += 1
+
+                    # Winner/loser scores
+                    if is_winner:
+                        winner_scores.append(sc)
+                    elif status != "active":
+                        loser_scores.append(sc)
+
+                    # Score brackets
+                    if sc >= 8.0:
+                        b80[0] += 1
+                        if is_winner: b80[1] += 1
+                    elif sc >= 7.5:
+                        b75[0] += 1
+                        if is_winner: b75[1] += 1
+                    elif sc >= 7.0:
+                        b70[0] += 1
+                        if is_winner: b70[1] += 1
+
+                    # Narrative
+                    if narr not in narr_stats:
+                        narr_stats[narr] = [0, 0.0, 0]  # count, total_x, winners
+                    narr_stats[narr][0] += 1
+                    narr_stats[narr][1] += px
+                    if is_winner:
+                        narr_stats[narr][2] += 1
+
+                    # Best/worst
+                    best_calls.append((name, px, sc))
+                    if status != "active":
+                        worst_calls.append((name, px, sc))
                 except Exception:
-                    no_pump += 1
-            
-            # Step 3: Build message with safe math
-            s_pct = int(success * 100 / total) if total else 0
-            m_pct = int(moderate * 100 / total) if total else 0
-            r_pct = int(rugged * 100 / total) if total else 0
-            n_pct = int(no_pump * 100 / total) if total else 0
-            
-            msg = "📊 <b>PERFORMANCE ANALYTICS</b>\n\n"
-            msg += f"<b>Total:</b> {total}\n\n"
-            msg += f"✅ 5X+: {success} ({s_pct}%)\n"
-            msg += f"⚠️ 2-5X: {moderate} ({m_pct}%)\n"
-            msg += f"💀 Rugged: {rugged} ({r_pct}%)\n"
-            msg += f"📉 No pump: {no_pump} ({n_pct}%)\n"
+                    continue
+
+            # Step 5: Build message
+            winners_total = success + moderate
+            pct = lambda n: int(n * 100 / total) if total else 0
+
+            msg = f"📊 <b>PERFORMANCE ANALYTICS — {period_label}</b>\n"
+            msg += f"<i>{total} alerts</i>\n\n"
+
+            msg += f"<b>── Results ──</b>\n"
+            msg += f"✅ 5X+: {success} ({pct(success)}%)\n"
+            msg += f"⚠️ 2-5X: {moderate} ({pct(moderate)}%)\n"
+            msg += f"💀 Rugged: {rugged} ({pct(rugged)}%)\n"
+            msg += f"📉 No pump: {no_pump} ({pct(no_pump)}%)\n"
             msg += f"⏳ Active: {active_count}\n"
-            
-            if top3:
-                msg += "\n<b>🔥 Top:</b>\n"
-                for tname, tpeak in sorted(top3, key=lambda x: x[1], reverse=True)[:3]:
-                    msg += f"  {tname} — {tpeak:.1f}X\n"
-            
-            await send_tg(msg, cid)
+            msg += f"<b>Win rate (2X+): {pct(winners_total)}%</b>\n\n"
+
+            avg_w = sum(winner_scores) / len(winner_scores) if winner_scores else 0
+            avg_l = sum(loser_scores) / len(loser_scores) if loser_scores else 0
+            msg += f"<b>── Score vs Performance ──</b>\n"
+            msg += f"Winners avg score: <b>{avg_w:.1f}</b>\n"
+            msg += f"Losers avg score:  <b>{avg_l:.1f}</b>\n\n"
+
+            def bstr(b):
+                if b[0] == 0: return "0 alerts"
+                return f"{b[0]} alerts → <b>{int(b[1]*100/b[0])}% hit 2X+</b>"
+
+            msg += f"<b>── Score Brackets ──</b>\n"
+            msg += f"7.0-7.5: {bstr(b70)}\n"
+            msg += f"7.5-8.0: {bstr(b75)}\n"
+            msg += f"8.0+:    {bstr(b80)}\n\n"
+
+            best_sorted = sorted(best_calls, key=lambda x: x[1], reverse=True)[:3]
+            if best_sorted:
+                msg += f"<b>── Best Calls ──</b>\n"
+                for i, (n, px, sc) in enumerate(best_sorted):
+                    medal = ["🥇", "🥈", "🥉"][i]
+                    msg += f"{medal} {n} — <b>{px:.1f}X</b> (score: {sc:.1f})\n"
+                msg += "\n"
+
+            worst_sorted = sorted(worst_calls, key=lambda x: x[1])[:3]
+            if worst_sorted:
+                msg += f"<b>── Worst Calls ──</b>\n"
+                for n, px, sc in worst_sorted:
+                    msg += f"💀 {n} — {px:.1f}X (score: {sc:.1f})\n"
+                msg += "\n"
+
+            if narr_stats:
+                msg += f"<b>── Narrative Performance ──</b>\n"
+                sorted_n = sorted(narr_stats.items(), key=lambda x: x[1][0], reverse=True)[:6]
+                for narr, (cnt, tot_x, wins) in sorted_n:
+                    avg_x = tot_x / cnt if cnt else 0
+                    w_rate = int(wins * 100 / cnt) if cnt else 0
+                    label = narr if narr != "?" else "no match"
+                    msg += f"  <b>{label}</b>: {cnt} → avg {avg_x:.1f}X ({w_rate}% win)\n"
+
+            # Step 6: Send — split if too long
+            if len(msg) > 4000:
+                mid = msg.rfind("\n\n", 0, 4000)
+                if mid > 0:
+                    await send_tg(msg[:mid], cid)
+                    await send_tg(msg[mid:], cid)
+                else:
+                    await send_tg(msg[:4000], cid)
+            else:
+                await send_tg(msg, cid)
             log.info("[ANALYTICS] Sent OK")
         except Exception as e:
             log.error(f"[ANALYTICS] FAILED: {e}")
@@ -1026,6 +1149,9 @@ async def handle_commands():
         '/narratives':  lambda cid: send_tg(format_narratives(), cid),
         '/tracking':    lambda cid: send_tg(format_tracking(), cid),
         '/analytics':   lambda cid: send_analytics(cid),
+        '/analytics24': lambda cid: send_analytics(cid, 1),
+        '/analytics7':  lambda cid: send_analytics(cid, 7),
+        '/analytics30': lambda cid: send_analytics(cid, 30),
         '/help':        lambda cid: send_tg(format_help(), cid),
     }
 
