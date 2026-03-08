@@ -1161,7 +1161,7 @@ async def _process_token(msg: dict):
     
     # ── Quick DexScreener check first (free, no API key) ─────────────────────
     # Low bar: just checking "is anyone buying this?" — quality gate comes later
-    TRACTION_MCAP = 3000  # Just above bonding curve base (~$2,400)
+    TRACTION_MCAP = max(MIN_MCAP, 3000)  # Match quality gate — no point enriching tokens that'll fail
     dex = await fetch_dexscreener(mint)
     dex_mcap = dex.get("mcap_usd", 0)
     dex_liq = dex.get("liquidity_usd", 0)
