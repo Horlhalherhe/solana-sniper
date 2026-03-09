@@ -33,7 +33,7 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 HELIUS_API_KEY     = os.getenv("HELIUS_API_KEY", "")
 BIRDEYE_API_KEY    = os.getenv("BIRDEYE_API_KEY", "")
 ALERT_THRESHOLD    = float(os.getenv("ALERT_THRESHOLD", "5.0"))
-MIN_MCAP           = float(os.getenv("MIN_MCAP", "2000"))
+MIN_MCAP           = float(os.getenv("MIN_MCAP", "5000"))
 MAX_MCAP           = float(os.getenv("MAX_ENTRY_MCAP", "100000"))
 MAX_DEV_HOLDS_PCT  = float(os.getenv("MAX_DEV_HOLDS_PCT", "8.0"))
 WAIT_SECONDS       = int(os.getenv("WAIT_SECONDS", "60"))
@@ -1404,8 +1404,90 @@ async def _process_token(msg: dict):
                     narrative=narrative.get("keyword", "?"),
                 )
             asyncio.create_task(save_leaderboard())
+
+        # Re-score after 5 minutes
+        asyncio.create_task(rescore_token(mint, name, symbol, deployer, desc, narrative, entry_mcap, score))
     else:
         log.info(f"  -> Score {score} < {ALERT_THRESHOLD} — skip")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RE-SCORE — confirms or warns 5 minutes after initial alert
+# ═══════════════════════════════════════════════════════════════════════════════
+RESCORE_DELAY = int(os.getenv("RESCORE_DELAY", "300"))  # 5 minutes default
+
+async def rescore_token(mint, name, symbol, deployer, desc, narrative, entry_mcap, initial_score):
+    try:
+        await asyncio.sleep(RESCORE_DELAY)
+        log.info(f"[RESCORE] Checking {name} (${symbol})...")
+
+        # Re-fetch fresh data
+        token, source = await enrich_token(mint, name, symbol, deployer)
+        if source == "none":
+            log.info(f"[RESCORE] {symbol} — no data, skipping")
+            return
+
+        new_mcap = token.get("mcap_usd", 0)
+        new_liq = token.get("liquidity_usd", 0)
+        new_vol = token.get("volume_1h_usd", 0)
+        new_holders = token.get("total_holders", 0)
+
+        # Re-score
+        result = score_token(token, narrative)
+        new_score = result["final_score"]
+
+        # Calculate change
+        if entry_mcap > 0 and new_mcap > 0:
+            mcap_change = ((new_mcap - entry_mcap) / entry_mcap) * 100
+            current_x = new_mcap / entry_mcap
+        else:
+            mcap_change = 0
+            current_x = 1.0
+
+        log.info(f"[RESCORE] {symbol}: {initial_score:.1f} → {new_score:.1f} | mcap ${entry_mcap:,.0f} → ${new_mcap:,.0f} ({mcap_change:+.0f}%)")
+
+        # Build confirmation message
+        if new_mcap > entry_mcap * 1.5 and new_score >= initial_score:
+            # Pumping harder — CONFIRMED
+            emoji = "🟢"
+            status = "CONFIRMED — STILL PUMPING"
+        elif new_mcap > entry_mcap * 1.1:
+            # Up slightly
+            emoji = "🟡"
+            status = "HOLDING — slight gain"
+        elif new_mcap > entry_mcap * 0.7:
+            # Roughly flat or small dip
+            emoji = "🟠"
+            status = "FLAT — no momentum"
+        else:
+            # Dumped
+            emoji = "🔴"
+            status = "FADING — mcap dropped"
+
+        score_dir = "↑" if new_score > initial_score else "↓" if new_score < initial_score else "→"
+
+        lines = [
+            f"{emoji} <b>RE-SCORE UPDATE (5min)</b>", "",
+            f"<b>{name}</b> <code>${symbol}</code>",
+            f"<code>{mint}</code>", "",
+            f"<b>{status}</b>", "",
+            f"📊 Score: {initial_score:.1f} {score_dir} <b>{new_score:.1f}</b>",
+            f"💰 MCap: ${entry_mcap:,.0f} → <b>${new_mcap:,.0f}</b> ({mcap_change:+.0f}%)",
+            f"📈 Current: <b>{current_x:.1f}X</b>",
+            f"💧 Liquidity: <b>${new_liq:,.0f}</b>",
+            f"📈 Vol 1h: <b>${new_vol:,.0f}</b>",
+            f"👥 Holders: <b>{new_holders}</b>", "",
+            f"🔗 <a href='https://pump.fun/{mint}'>pump.fun</a>  "
+            f"<a href='https://dexscreener.com/solana/{mint}'>dexscreener</a>  "
+            f"<a href='https://gmgn.ai/sol/token/{mint}'>gmgn</a>",
+            f"<i>🕐 {utcnow().strftime('%H:%M:%S UTC')}</i>",
+        ]
+
+        await send_tg("\n".join(lines))
+        log.info(f"[RESCORE] Sent {status} for {symbol}")
+
+    except Exception as e:
+        log.error(f"[RESCORE] {mint[:12]}: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
