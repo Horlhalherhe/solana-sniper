@@ -364,7 +364,7 @@ class TrackedToken:
         self.last_updated       = utcnow()
 
     def current_x(self):
-        return round(self.current_mcap / max(self.entry_mcap, 1), 2)
+        return min(round(self.current_mcap / max(self.entry_mcap, 1000), 2), 500)
     
     def classify_outcome(self):
         if self.status == "active":
@@ -867,7 +867,7 @@ async def track_tokens():
                     t = tracked[mint]
                     t.current_mcap = mcap
                     t.peak_mcap = max(t.peak_mcap, mcap)
-                    t.peak_x = t.peak_mcap / max(t.entry_mcap, 1)
+                    t.peak_x = min(t.peak_mcap / max(t.entry_mcap, 1000), 500)  # Cap at 500X
                     t.last_updated = utcnow()
                     
                     if migrated and not t.migration_verified:
@@ -1394,16 +1394,17 @@ async def _process_token(msg: dict):
         log.info(f"  🎯 FIRING — {name} (${symbol})")
         await send_tg(format_alert(token, result, narrative))
 
-        # Track
-        entry_mcap = mcap if mcap > 0 else liq
-        if entry_mcap > 0:
-            async with tracked_lock:
-                tracked[mint] = TrackedToken(
-                    mint=mint, name=name, symbol=symbol,
-                    entry_mcap=entry_mcap, entry_score=score,
-                    narrative=narrative.get("keyword", "?"),
-                )
-            asyncio.create_task(save_leaderboard())
+        # Track — entry_mcap must be at least MIN_MCAP to avoid fake X multipliers
+        entry_mcap = mcap if mcap >= MIN_MCAP else liq if liq >= 1000 else mcap
+        entry_mcap = max(entry_mcap, MIN_MCAP)  # Floor — never track below MIN_MCAP
+        
+        async with tracked_lock:
+            tracked[mint] = TrackedToken(
+                mint=mint, name=name, symbol=symbol,
+                entry_mcap=entry_mcap, entry_score=score,
+                narrative=narrative.get("keyword", "?"),
+            )
+        asyncio.create_task(save_leaderboard())
 
         # Re-score after 5 minutes
         asyncio.create_task(rescore_token(mint, name, symbol, deployer, desc, narrative, entry_mcap, score))
