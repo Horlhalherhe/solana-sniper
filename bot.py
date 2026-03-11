@@ -684,6 +684,35 @@ async def get_current_mcap(mint: str) -> Tuple[float, bool]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SOCIAL LINK PARSER
+# ═══════════════════════════════════════════════════════════════════════════════
+_URL_PATTERN = re.compile(r'https?://[^\s<>"\')\]]+', re.IGNORECASE)
+
+def parse_socials(description: str) -> dict:
+    """Extract social links from token description."""
+    socials = {"twitter": None, "telegram": None, "website": None}
+    if not description:
+        return socials
+    
+    urls = _URL_PATTERN.findall(description)
+    for url in urls:
+        url_lower = url.lower().rstrip("/.,;:!?")
+        try:
+            if "twitter.com/" in url_lower or "x.com/" in url_lower:
+                socials["twitter"] = url_lower
+            elif "t.me/" in url_lower or "telegram" in url_lower:
+                socials["telegram"] = url_lower
+            elif socials["website"] is None:
+                # First non-twitter/telegram URL = website
+                if "pump.fun" not in url_lower and "dexscreener" not in url_lower and "solscan" not in url_lower:
+                    socials["website"] = url_lower
+        except Exception:
+            continue
+    
+    return socials
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # FORMATTERS
 # ═══════════════════════════════════════════════════════════════════════════════
 def format_alert(token: dict, score: dict, narrative: dict) -> str:
@@ -726,8 +755,25 @@ def format_alert(token: dict, score: dict, narrative: dict) -> str:
         f"<a href='https://dexscreener.com/solana/{mint}'>dexscreener</a>  "
         f"<a href='https://gmgn.ai/sol/token/{mint}'>gmgn</a>  "
         f"<a href='https://solscan.io/token/{mint}'>solscan</a>",
-        f"<i>🕐 {utcnow().strftime('%H:%M:%S UTC')}</i>",
     ]
+    
+    # Social links from token description
+    socials = parse_socials(token.get("description", ""))
+    social_lines = []
+    if socials["twitter"]:
+        social_lines.append(f"🐦 <a href='{socials['twitter']}'>X / Twitter</a>")
+    if socials["telegram"]:
+        social_lines.append(f"💬 <a href='{socials['telegram']}'>Telegram</a>")
+    if socials["website"]:
+        social_lines.append(f"🌐 <a href='{socials['website']}'>Website</a>")
+    
+    if social_lines:
+        lines.append("  ".join(social_lines))
+    else:
+        lines.append("⚠️ <i>No socials found</i>")
+    
+    lines.append(f"<i>🕐 {utcnow().strftime('%H:%M:%S UTC')}</i>")
+    
     return "\n".join(lines)
 
 
@@ -1406,89 +1452,196 @@ async def _process_token(msg: dict):
             )
         asyncio.create_task(save_leaderboard())
 
-        # Re-score after 5 minutes
-        asyncio.create_task(rescore_token(mint, name, symbol, deployer, desc, narrative, entry_mcap, score))
+        # Lifecycle tracker — monitors at 5min, 15min, 30min, 1hr
+        asyncio.create_task(lifecycle_tracker(mint, name, symbol, deployer, desc, narrative, entry_mcap, score))
     else:
         log.info(f"  -> Score {score} < {ALERT_THRESHOLD} — skip")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# RE-SCORE — confirms or warns 5 minutes after initial alert
+# LIFECYCLE TRACKER — monitors token at checkpoints after alert
 # ═══════════════════════════════════════════════════════════════════════════════
-RESCORE_DELAY = int(os.getenv("RESCORE_DELAY", "300"))  # 5 minutes default
+LIFECYCLE_CHECKPOINTS = [
+    (300, "5min"),     # 5 minutes
+    (900, "15min"),    # 15 minutes (cumulative: wait 600 more)
+    (1800, "30min"),   # 30 minutes (cumulative: wait 900 more)
+    (3600, "1hr"),     # 1 hour (cumulative: wait 1800 more)
+]
 
-async def rescore_token(mint, name, symbol, deployer, desc, narrative, entry_mcap, initial_score):
+async def lifecycle_tracker(mint, name, symbol, deployer, desc, narrative, entry_mcap, initial_score):
     try:
-        await asyncio.sleep(RESCORE_DELAY)
-        log.info(f"[RESCORE] Checking {name} (${symbol})...")
-
-        # Re-fetch fresh data
-        token, source = await enrich_token(mint, name, symbol, deployer)
-        if source == "none":
-            log.info(f"[RESCORE] {symbol} — no data, skipping")
-            return
-
-        new_mcap = token.get("mcap_usd", 0)
-        new_liq = token.get("liquidity_usd", 0)
-        new_vol = token.get("volume_1h_usd", 0)
-        new_holders = token.get("total_holders", 0)
-
-        # Re-score
-        result = score_token(token, narrative)
-        new_score = result["final_score"]
-
-        # Calculate change
-        if entry_mcap > 0 and new_mcap > 0:
-            mcap_change = ((new_mcap - entry_mcap) / entry_mcap) * 100
-            current_x = new_mcap / entry_mcap
-        else:
-            mcap_change = 0
-            current_x = 1.0
-
-        log.info(f"[RESCORE] {symbol}: {initial_score:.1f} → {new_score:.1f} | mcap ${entry_mcap:,.0f} → ${new_mcap:,.0f} ({mcap_change:+.0f}%)")
-
-        # Build confirmation message
-        if new_mcap > entry_mcap * 1.5 and new_score >= initial_score:
-            # Pumping harder — CONFIRMED
-            emoji = "🟢"
-            status = "CONFIRMED — STILL PUMPING"
-        elif new_mcap > entry_mcap * 1.1:
-            # Up slightly
-            emoji = "🟡"
-            status = "HOLDING — slight gain"
-        elif new_mcap > entry_mcap * 0.7:
-            # Roughly flat or small dip
-            emoji = "🟠"
-            status = "FLAT — no momentum"
-        else:
-            # Dumped
-            emoji = "🔴"
-            status = "FADING — mcap dropped"
-
-        score_dir = "↑" if new_score > initial_score else "↓" if new_score < initial_score else "→"
-
+        checkpoints = []
+        last_time = 0
+        
+        # Record entry snapshot
+        entry_snap = {"label": "Entry", "mcap": entry_mcap, "holders": 0, "vol": 0, "buy_ratio": 0}
+        checkpoints.append(entry_snap)
+        
+        for delay_total, label in LIFECYCLE_CHECKPOINTS:
+            try:
+                # Wait the difference from last checkpoint
+                wait_secs = delay_total - last_time
+                await asyncio.sleep(wait_secs)
+                last_time = delay_total
+                
+                # Fetch fresh data
+                mcap_now = 0.0
+                liq_now = 0.0
+                vol_now = 0.0
+                holders_now = 0
+                buy_ratio_now = 0.0
+                
+                try:
+                    dex = await fetch_dexscreener(mint)
+                    mcap_now = dex.get("mcap_usd", 0)
+                    liq_now = dex.get("liquidity_usd", 0)
+                    vol_now = dex.get("volume_1h_usd", 0)
+                    holders_now = dex.get("total_holders", 0)
+                    buy_ratio_now = dex.get("buy_sell_ratio_1h", 0)
+                except Exception:
+                    pass
+                
+                # If DexScreener failed, try Birdeye
+                if mcap_now == 0 and BIRDEYE_API_KEY:
+                    try:
+                        async with httpx.AsyncClient(timeout=8) as client:
+                            resp = await client.get(
+                                "https://public-api.birdeye.so/defi/token_overview",
+                                params={"address": mint},
+                                headers={"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana"})
+                            if resp.status_code == 200:
+                                d = resp.json().get("data") or {}
+                                mcap_now = float(d.get("mc") or 0)
+                                liq_now = float(d.get("liquidity") or 0)
+                                vol_now = float(d.get("v1hUSD") or 0)
+                                holders_now = int(d.get("holder") or 0)
+                                buys = int(d.get("buy1h") or 1)
+                                sells = int(d.get("sell1h") or 1)
+                                buy_ratio_now = buys / max(sells, 1)
+                    except Exception:
+                        pass
+                
+                current_x = min(mcap_now / max(entry_mcap, 1000), 500) if mcap_now > 0 else 0
+                
+                snap = {
+                    "label": label,
+                    "mcap": mcap_now,
+                    "holders": holders_now,
+                    "vol": vol_now,
+                    "buy_ratio": buy_ratio_now,
+                    "liq": liq_now,
+                    "x": current_x,
+                }
+                checkpoints.append(snap)
+                
+                log.info(f"[LIFECYCLE] {symbol} @ {label}: mcap=${mcap_now:,.0f} ({current_x:.1f}X) holders={holders_now} vol=${vol_now:,.0f}")
+                
+            except Exception as e:
+                log.warning(f"[LIFECYCLE] {symbol} @ {label}: {e}")
+                checkpoints.append({"label": label, "mcap": 0, "holders": 0, "vol": 0, "buy_ratio": 0, "liq": 0, "x": 0})
+        
+        # ── Build final lifecycle report ──────────────────────────────────────
         lines = [
-            f"{emoji} <b>RE-SCORE UPDATE (5min)</b>", "",
-            f"<b>{name}</b> <code>${symbol}</code>",
+            "📊 <b>LIFECYCLE REPORT</b>", "",
+            f"<b>{name}</b>  <code>${symbol}</code>",
             f"<code>{mint}</code>", "",
-            f"<b>{status}</b>", "",
-            f"📊 Score: {initial_score:.1f} {score_dir} <b>{new_score:.1f}</b>",
-            f"💰 MCap: ${entry_mcap:,.0f} → <b>${new_mcap:,.0f}</b> ({mcap_change:+.0f}%)",
-            f"📈 Current: <b>{current_x:.1f}X</b>",
-            f"💧 Liquidity: <b>${new_liq:,.0f}</b>",
-            f"📈 Vol 1h: <b>${new_vol:,.0f}</b>",
-            f"👥 Holders: <b>{new_holders}</b>", "",
+        ]
+        
+        # Find peak
+        peak_x = 0
+        peak_label = "Entry"
+        for snap in checkpoints:
+            x = snap.get("x", 0)
+            if x > peak_x:
+                peak_x = x
+                peak_label = snap["label"]
+        
+        # Determine pattern
+        xs = [snap.get("x", 0) for snap in checkpoints[1:]]  # Skip entry
+        if len(xs) >= 4:
+            if xs[3] >= 2.0 and xs[3] >= xs[0]:
+                pattern = "🟢 STRONG HOLD — still growing at 1hr"
+                suggestion = "Could run further — watch for migration"
+            elif peak_x >= 3.0 and xs[3] < peak_x * 0.5:
+                pattern = "🔴 PUMP & DUMP — peaked then crashed"
+                suggestion = f"Exit window was before {peak_label}"
+            elif peak_x >= 2.0 and xs[3] >= 1.0:
+                pattern = "🟡 PUMPED & SETTLING — took profit window existed"
+                suggestion = f"Best exit around {peak_label} at {peak_x:.1f}X"
+            elif all(x < 1.5 for x in xs):
+                pattern = "🟠 SLOW — never gained momentum"
+                suggestion = "Skip similar setups"
+            elif xs[3] < 0.5:
+                pattern = "💀 DEAD — collapsed to near zero"
+                suggestion = "Likely rug or complete dump"
+            else:
+                pattern = "⚪ MIXED — no clear pattern"
+                suggestion = "Monitor manually"
+        else:
+            pattern = "⚪ INCOMPLETE — missing checkpoints"
+            suggestion = "Data was unavailable"
+        
+        lines.append(f"<b>{pattern}</b>")
+        lines.append(f"<i>{suggestion}</i>")
+        lines.append("")
+        
+        # Timeline
+        lines.append("<b>── Timeline ──</b>")
+        lines.append(f"  Entry:  ${entry_mcap:,.0f}")
+        
+        for snap in checkpoints[1:]:
+            label = snap["label"]
+            sm = snap.get("mcap", 0)
+            sx = snap.get("x", 0)
+            sh = snap.get("holders", 0)
+            sv = snap.get("vol", 0)
+            sbr = snap.get("buy_ratio", 0)
+            
+            if sx >= 2.0:
+                dot = "🟢"
+            elif sx >= 1.0:
+                dot = "🟡"
+            elif sx > 0:
+                dot = "🔴"
+            else:
+                dot = "⚫"
+            
+            lines.append(f"  {label:5s}: ${sm:,.0f} ({sx:.1f}X) {dot}  |  {sh}h  ${sv:,.0f}vol  {sbr:.1f}b/s")
+        
+        lines.append("")
+        lines.append(f"📈 Peak: <b>{peak_x:.1f}X</b> at {peak_label}")
+        
+        # Holder growth analysis
+        h_5 = checkpoints[1].get("holders", 0) if len(checkpoints) > 1 else 0
+        h_60 = checkpoints[-1].get("holders", 0) if len(checkpoints) > 1 else 0
+        if h_5 > 0 and h_60 > h_5:
+            h_growth = int((h_60 - h_5) / h_5 * 100)
+            lines.append(f"👥 Holder growth: {h_5} → {h_60} (+{h_growth}%)")
+        elif h_5 > 0:
+            lines.append(f"👥 Holders stalled: {h_5} → {h_60}")
+        
+        # Volume trend
+        v_5 = checkpoints[1].get("vol", 0) if len(checkpoints) > 1 else 0
+        v_60 = checkpoints[-1].get("vol", 0) if len(checkpoints) > 1 else 0
+        if v_5 > 0 and v_60 > 0:
+            if v_60 > v_5 * 1.5:
+                lines.append(f"📈 Volume increasing: ${v_5:,.0f} → ${v_60:,.0f}")
+            elif v_60 < v_5 * 0.5:
+                lines.append(f"📉 Volume dying: ${v_5:,.0f} → ${v_60:,.0f}")
+        
+        lines += [
+            "",
             f"🔗 <a href='https://pump.fun/{mint}'>pump.fun</a>  "
             f"<a href='https://dexscreener.com/solana/{mint}'>dexscreener</a>  "
             f"<a href='https://gmgn.ai/sol/token/{mint}'>gmgn</a>",
             f"<i>🕐 {utcnow().strftime('%H:%M:%S UTC')}</i>",
         ]
-
+        
         await send_tg("\n".join(lines))
-        log.info(f"[RESCORE] Sent {status} for {symbol}")
-
+        log.info(f"[LIFECYCLE] Sent report for {symbol} — peak {peak_x:.1f}X at {peak_label} — {pattern[:20]}")
+        
     except Exception as e:
-        log.error(f"[RESCORE] {mint[:12]}: {e}")
+        log.error(f"[LIFECYCLE] {mint[:12]}: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
