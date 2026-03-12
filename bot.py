@@ -362,6 +362,8 @@ class TrackedToken:
         self.added_at           = utcnow()
         self.status             = "active"
         self.last_updated       = utcnow()
+        self.lifecycle_data     = {}   # Filled by lifecycle_tracker
+        self.has_socials        = False
 
     def current_x(self):
         return min(round(self.current_mcap / max(self.entry_mcap, 1000), 2), 500)
@@ -384,6 +386,8 @@ class TrackedToken:
             "migration_verified": self.migration_verified, "status": self.status,
             "added_at": self.added_at.isoformat(),
             "last_updated": self.last_updated.isoformat(),
+            "lifecycle": self.lifecycle_data,
+            "has_socials": self.has_socials,
         }
 
 
@@ -757,15 +761,28 @@ def format_alert(token: dict, score: dict, narrative: dict) -> str:
         f"<a href='https://solscan.io/token/{mint}'>solscan</a>",
     ]
     
-    # Social links from token description
-    socials = parse_socials(token.get("description", ""))
+    # Social links from pump.fun token data
+    socials = token.get("socials", {})
+    # Fallback: also try parsing description for URLs
+    if not any(socials.values()):
+        socials = parse_socials(token.get("description", ""))
+    
     social_lines = []
-    if socials["twitter"]:
-        social_lines.append(f"🐦 <a href='{socials['twitter']}'>X / Twitter</a>")
-    if socials["telegram"]:
-        social_lines.append(f"💬 <a href='{socials['telegram']}'>Telegram</a>")
-    if socials["website"]:
-        social_lines.append(f"🌐 <a href='{socials['website']}'>Website</a>")
+    if socials.get("twitter"):
+        tw = socials["twitter"]
+        if not tw.startswith("http"):
+            tw = f"https://x.com/{tw}"
+        social_lines.append(f"🐦 <a href='{tw}'>X / Twitter</a>")
+    if socials.get("telegram"):
+        tg = socials["telegram"]
+        if not tg.startswith("http"):
+            tg = f"https://t.me/{tg}"
+        social_lines.append(f"💬 <a href='{tg}'>Telegram</a>")
+    if socials.get("website"):
+        ws = socials["website"]
+        if not ws.startswith("http"):
+            ws = f"https://{ws}"
+        social_lines.append(f"🌐 <a href='{ws}'>Website</a>")
     
     if social_lines:
         lines.append("  ".join(social_lines))
@@ -883,6 +900,7 @@ def format_help() -> str:
         "/analytics24  — last 24h report",
         "/analytics7   — last 7 day report",
         "/analytics30  — last 30 day report",
+        "/patterns     — win vs loss patterns",
         "/help         — this menu",
     ])
 
@@ -1187,6 +1205,177 @@ async def handle_commands():
             except Exception:
                 pass
 
+    async def send_patterns(cid):
+        log.info("[PATTERNS] Command received")
+        try:
+            # Snapshot data
+            all_records = []
+            try:
+                async with tracked_lock:
+                    for t in tracked.values():
+                        r = t.to_record()
+                        all_records.append(r)
+            except Exception:
+                pass
+            try:
+                async with history_lock:
+                    all_records.extend(list(leaderboard_history))
+            except Exception:
+                pass
+            
+            # Filter to tokens with lifecycle data
+            with_lc = [r for r in all_records if r.get("lifecycle") and isinstance(r.get("lifecycle"), dict) and "5min" in r.get("lifecycle", {})]
+            
+            if len(with_lc) < 3:
+                await send_tg(f"📊 Need more data. Only {len(with_lc)} tokens have lifecycle data. Keep running!", cid)
+                return
+            
+            # Split into winners and losers
+            winners = [r for r in with_lc if r.get("peak_x", 1.0) >= 2.0]
+            losers = [r for r in with_lc if r.get("peak_x", 1.0) < 2.0 and r.get("status") != "active"]
+            active = [r for r in with_lc if r.get("status") == "active"]
+            
+            total = len(with_lc)
+            
+            def avg_safe(lst):
+                return sum(lst) / len(lst) if lst else 0
+            
+            def get_lc(record, checkpoint, field):
+                try:
+                    return float(record.get("lifecycle", {}).get(checkpoint, {}).get(field, 0))
+                except Exception:
+                    return 0
+            
+            msg = f"📊 <b>WIN vs LOSS PATTERNS</b>\n"
+            msg += f"<i>{total} tokens with lifecycle data</i>\n"
+            msg += f"<i>{len(winners)} winners | {len(losers)} losers | {len(active)} active</i>\n\n"
+            
+            # Build comparison for each checkpoint
+            for cp in ["5min", "15min", "30min", "1hr"]:
+                w_mcap = avg_safe([get_lc(r, cp, "mcap") for r in winners]) if winners else 0
+                l_mcap = avg_safe([get_lc(r, cp, "mcap") for r in losers]) if losers else 0
+                w_hold = avg_safe([get_lc(r, cp, "holders") for r in winners]) if winners else 0
+                l_hold = avg_safe([get_lc(r, cp, "holders") for r in losers]) if losers else 0
+                w_vol = avg_safe([get_lc(r, cp, "vol") for r in winners]) if winners else 0
+                l_vol = avg_safe([get_lc(r, cp, "vol") for r in losers]) if losers else 0
+                w_br = avg_safe([get_lc(r, cp, "buy_ratio") for r in winners]) if winners else 0
+                l_br = avg_safe([get_lc(r, cp, "buy_ratio") for r in losers]) if losers else 0
+                w_x = avg_safe([get_lc(r, cp, "x") for r in winners]) if winners else 0
+                l_x = avg_safe([get_lc(r, cp, "x") for r in losers]) if losers else 0
+                
+                msg += f"<b>── At {cp} ──</b>\n"
+                msg += f"{'':16s} {'WIN':>8s}  {'LOSS':>8s}\n"
+                msg += f"MCap:        ${w_mcap:>7,.0f}  ${l_mcap:>7,.0f}\n"
+                msg += f"Holders:     {w_hold:>8.0f}  {l_hold:>8.0f}\n"
+                msg += f"Volume:      ${w_vol:>7,.0f}  ${l_vol:>7,.0f}\n"
+                msg += f"Buy/Sell:    {w_br:>8.1f}  {l_br:>8.1f}\n"
+                msg += f"X from entry:{w_x:>8.1f}  {l_x:>8.1f}\n\n"
+            
+            # Key signals
+            msg += f"<b>── Key Signals ──</b>\n"
+            
+            # Holder growth: 5min to 1hr
+            w_hgrowth = []
+            l_hgrowth = []
+            for r in winners:
+                h5 = get_lc(r, "5min", "holders")
+                h60 = get_lc(r, "1hr", "holders")
+                if h5 > 0:
+                    w_hgrowth.append((h60 - h5) / h5 * 100)
+            for r in losers:
+                h5 = get_lc(r, "5min", "holders")
+                h60 = get_lc(r, "1hr", "holders")
+                if h5 > 0:
+                    l_hgrowth.append((h60 - h5) / h5 * 100)
+            
+            if w_hgrowth or l_hgrowth:
+                wg = avg_safe(w_hgrowth) if w_hgrowth else 0
+                lg = avg_safe(l_hgrowth) if l_hgrowth else 0
+                msg += f"Holder growth 5m→1h: WIN <b>+{wg:.0f}%</b> vs LOSS <b>+{lg:.0f}%</b>\n"
+            
+            # Volume trend: 5min to 1hr
+            w_vtrend = []
+            l_vtrend = []
+            for r in winners:
+                v5 = get_lc(r, "5min", "vol")
+                v60 = get_lc(r, "1hr", "vol")
+                if v5 > 0:
+                    w_vtrend.append((v60 - v5) / v5 * 100)
+            for r in losers:
+                v5 = get_lc(r, "5min", "vol")
+                v60 = get_lc(r, "1hr", "vol")
+                if v5 > 0:
+                    l_vtrend.append((v60 - v5) / v5 * 100)
+            
+            if w_vtrend or l_vtrend:
+                wv = avg_safe(w_vtrend) if w_vtrend else 0
+                lv = avg_safe(l_vtrend) if l_vtrend else 0
+                msg += f"Volume trend 5m→1h: WIN <b>{wv:+.0f}%</b> vs LOSS <b>{lv:+.0f}%</b>\n"
+            
+            # Socials comparison
+            w_social = len([r for r in winners if r.get("has_socials")]) 
+            l_social = len([r for r in losers if r.get("has_socials")])
+            w_social_pct = int(w_social * 100 / len(winners)) if winners else 0
+            l_social_pct = int(l_social * 100 / len(losers)) if losers else 0
+            msg += f"Has socials: WIN <b>{w_social_pct}%</b> vs LOSS <b>{l_social_pct}%</b>\n"
+            
+            # Score comparison
+            w_scores = [float(r.get("entry_score", 0)) for r in winners if r.get("entry_score")]
+            l_scores = [float(r.get("entry_score", 0)) for r in losers if r.get("entry_score")]
+            if w_scores or l_scores:
+                msg += f"Avg score: WIN <b>{avg_safe(w_scores):.1f}</b> vs LOSS <b>{avg_safe(l_scores):.1f}</b>\n"
+            
+            # Quick rules
+            msg += f"\n<b>── Quick Rules ──</b>\n"
+            
+            # Rule: holders at 5min
+            h5_winners = [get_lc(r, "5min", "holders") for r in winners]
+            h5_losers = [get_lc(r, "5min", "holders") for r in losers]
+            if h5_winners and h5_losers:
+                avg_hw = avg_safe(h5_winners)
+                avg_hl = avg_safe(h5_losers)
+                if avg_hw > avg_hl * 1.3:
+                    msg += f"🟢 Winners have more holders at 5min ({avg_hw:.0f} vs {avg_hl:.0f})\n"
+                elif avg_hl > avg_hw * 1.3:
+                    msg += f"⚠️ Losers have more holders at 5min ({avg_hl:.0f} vs {avg_hw:.0f})\n"
+            
+            # Rule: buy ratio at 5min
+            br5_winners = [get_lc(r, "5min", "buy_ratio") for r in winners if get_lc(r, "5min", "buy_ratio") > 0]
+            br5_losers = [get_lc(r, "5min", "buy_ratio") for r in losers if get_lc(r, "5min", "buy_ratio") > 0]
+            if br5_winners and br5_losers:
+                avg_brw = avg_safe(br5_winners)
+                avg_brl = avg_safe(br5_losers)
+                if avg_brw > avg_brl:
+                    msg += f"🟢 Winners have higher buy pressure at 5min ({avg_brw:.1f} vs {avg_brl:.1f})\n"
+                else:
+                    msg += f"⚠️ Losers have higher buy pressure at 5min ({avg_brl:.1f} vs {avg_brw:.1f})\n"
+            
+            # Rule: X at 5min
+            x5_high_win = len([r for r in winners if get_lc(r, "5min", "x") >= 1.5])
+            x5_high_lose = len([r for r in losers if get_lc(r, "5min", "x") >= 1.5])
+            x5_total_high = x5_high_win + x5_high_lose
+            if x5_total_high > 0:
+                x5_win_rate = int(x5_high_win * 100 / x5_total_high)
+                msg += f"🔍 Tokens already 1.5X+ at 5min: {x5_win_rate}% become winners\n"
+            
+            # Send — split if needed
+            if len(msg) > 4000:
+                mid = msg.rfind("\n\n", 0, 4000)
+                if mid > 0:
+                    await send_tg(msg[:mid], cid)
+                    await send_tg(msg[mid:], cid)
+                else:
+                    await send_tg(msg[:4000], cid)
+            else:
+                await send_tg(msg, cid)
+            log.info("[PATTERNS] Sent OK")
+        except Exception as e:
+            log.error(f"[PATTERNS] FAILED: {e}")
+            try:
+                await send_tg(f"⚠️ Patterns error: {e}", cid)
+            except Exception:
+                pass
+
     commands = {
         '/status':      lambda cid: send_tg(format_status(), cid),
         '/leaderboard': lambda cid: send_lb(cid, 1),
@@ -1198,6 +1387,7 @@ async def handle_commands():
         '/analytics24': lambda cid: send_analytics(cid, 1),
         '/analytics7':  lambda cid: send_analytics(cid, 7),
         '/analytics30': lambda cid: send_analytics(cid, 30),
+        '/patterns':    lambda cid: send_patterns(cid),
         '/help':        lambda cid: send_tg(format_help(), cid),
     }
 
@@ -1308,6 +1498,13 @@ async def _process_token(msg: dict):
     symbol   = msg.get("symbol", "")
     deployer = msg.get("traderPublicKey", "")
     desc     = msg.get("description", "")
+    
+    # Pump.fun sends socials as separate fields
+    socials_raw = {
+        "twitter":  msg.get("twitter", "") or "",
+        "telegram": msg.get("telegram", "") or "",
+        "website":  msg.get("website", "") or "",
+    }
 
     if not mint or not name: return
     if len(mint) < 32 or len(mint) > 44: return
@@ -1371,6 +1568,7 @@ async def _process_token(msg: dict):
     # ── Full enrichment (Helius + Birdeye/DexScreener) ────────────────────────
     token, source = await enrich_token(mint, name, symbol, deployer)
     token["description"] = desc
+    token["socials"] = socials_raw
 
     if source == "none":
         log.info(f"  -> No data — skip")
@@ -1445,11 +1643,14 @@ async def _process_token(msg: dict):
         entry_mcap = max(entry_mcap, MIN_MCAP)  # Floor — never track below MIN_MCAP
         
         async with tracked_lock:
-            tracked[mint] = TrackedToken(
+            t = TrackedToken(
                 mint=mint, name=name, symbol=symbol,
                 entry_mcap=entry_mcap, entry_score=score,
                 narrative=narrative.get("keyword", "?"),
             )
+            socials = socials_raw
+            t.has_socials = bool(socials.get("twitter") or socials.get("telegram") or socials.get("website"))
+            tracked[mint] = t
         asyncio.create_task(save_leaderboard())
 
         # Lifecycle tracker — monitors at 5min, 15min, 30min, 1hr
@@ -1639,6 +1840,25 @@ async def lifecycle_tracker(mint, name, symbol, deployer, desc, narrative, entry
         
         await send_tg("\n".join(lines))
         log.info(f"[LIFECYCLE] Sent report for {symbol} — peak {peak_x:.1f}X at {peak_label} — {pattern[:20]}")
+        
+        # Save lifecycle data to tracked token for pattern analysis
+        try:
+            lifecycle_record = {
+                "peak_x": peak_x, "peak_label": peak_label, "pattern": pattern[:30],
+            }
+            for snap in checkpoints[1:]:
+                lbl = snap.get("label", "?")
+                lifecycle_record[lbl] = {
+                    "mcap": snap.get("mcap", 0), "holders": snap.get("holders", 0),
+                    "vol": snap.get("vol", 0), "buy_ratio": snap.get("buy_ratio", 0),
+                    "x": snap.get("x", 0),
+                }
+            async with tracked_lock:
+                if mint in tracked:
+                    tracked[mint].lifecycle_data = lifecycle_record
+            asyncio.create_task(save_leaderboard())
+        except Exception:
+            pass
         
     except Exception as e:
         log.error(f"[LIFECYCLE] {mint[:12]}: {e}")
