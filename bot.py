@@ -692,6 +692,24 @@ async def get_current_mcap(mint: str) -> Tuple[float, bool]:
 # ═══════════════════════════════════════════════════════════════════════════════
 _URL_PATTERN = re.compile(r'https?://[^\s<>"\')\]]+', re.IGNORECASE)
 
+async def fetch_token_socials(uri: str) -> dict:
+    """Fetch IPFS metadata JSON to extract social links."""
+    socials = {"twitter": "", "telegram": "", "website": ""}
+    if not uri:
+        return socials
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(uri, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code == 200:
+                data = resp.json()
+                socials["twitter"] = str(data.get("twitter", "") or "")
+                socials["telegram"] = str(data.get("telegram", "") or "")
+                socials["website"] = str(data.get("website", "") or "")
+                log.info(f"  -> Socials: tw={bool(socials['twitter'])} tg={bool(socials['telegram'])} web={bool(socials['website'])}")
+    except Exception as e:
+        log.warning(f"[SOCIALS] Fetch failed: {e}")
+    return socials
+
 def parse_socials(description: str) -> dict:
     """Extract social links from token description."""
     socials = {"twitter": None, "telegram": None, "website": None}
@@ -1499,28 +1517,10 @@ async def _process_token(msg: dict):
     deployer = msg.get("traderPublicKey", "")
     desc     = msg.get("description", "")
     
-    # Pump.fun sends socials as separate fields
-    # Try multiple possible field names
-    socials_raw = {
-        "twitter":  msg.get("twitter", "") or msg.get("twitterLink", "") or msg.get("twitterUrl", "") or "",
-        "telegram": msg.get("telegram", "") or msg.get("telegramLink", "") or msg.get("telegramUrl", "") or "",
-        "website":  msg.get("website", "") or msg.get("websiteLink", "") or msg.get("websiteUrl", "") or msg.get("uri", "") or "",
-    }
-    
-    # Also try parsing from description as fallback
-    if not any(socials_raw.values()) and desc:
-        parsed = parse_socials(desc)
-        if any(parsed.values()):
-            socials_raw = parsed
-    
-    # Debug: log ALL keys from first token to find social field names
-    if not hasattr(_process_token, '_debug_done'):
-        _process_token._debug_done = True
-        log.info(f"  -> [DEBUG] ALL WS keys: {list(msg.keys())}")
-        # Also log any values that look like URLs or socials
-        for k, v in msg.items():
-            if v and isinstance(v, str) and ("http" in str(v).lower() or "t.me" in str(v).lower() or "twitter" in str(v).lower() or "x.com" in str(v).lower()):
-                log.info(f"  -> [DEBUG] Social? {k} = {v[:80]}")
+    # Pump.fun stores socials in IPFS metadata (uri field)
+    # We'll fetch it only for tokens that pass all filters
+    token_uri = msg.get("uri", "")
+    socials_raw = {"twitter": "", "telegram": "", "website": ""}
 
     if not mint or not name: return
     if len(mint) < 32 or len(mint) > 44: return
@@ -1584,7 +1584,6 @@ async def _process_token(msg: dict):
     # ── Full enrichment (Helius + Birdeye/DexScreener) ────────────────────────
     token, source = await enrich_token(mint, name, symbol, deployer)
     token["description"] = desc
-    token["socials"] = socials_raw
 
     if source == "none":
         log.info(f"  -> No data — skip")
@@ -1649,6 +1648,11 @@ async def _process_token(msg: dict):
 
     # ── Alert ────────────────────────────────────────────────────────────────
     if score >= ALERT_THRESHOLD:
+        # Fetch socials from IPFS metadata (only for tokens that pass all filters)
+        if token_uri:
+            socials_raw = await fetch_token_socials(token_uri)
+        token["socials"] = socials_raw
+        
         async with alerts_lock:
             total_alerts_fired += 1
         log.info(f"  🎯 FIRING — {name} (${symbol})")
