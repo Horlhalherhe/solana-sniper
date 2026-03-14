@@ -1500,11 +1500,27 @@ async def _process_token(msg: dict):
     desc     = msg.get("description", "")
     
     # Pump.fun sends socials as separate fields
+    # Try multiple possible field names
     socials_raw = {
-        "twitter":  msg.get("twitter", "") or "",
-        "telegram": msg.get("telegram", "") or "",
-        "website":  msg.get("website", "") or "",
+        "twitter":  msg.get("twitter", "") or msg.get("twitterLink", "") or msg.get("twitterUrl", "") or "",
+        "telegram": msg.get("telegram", "") or msg.get("telegramLink", "") or msg.get("telegramUrl", "") or "",
+        "website":  msg.get("website", "") or msg.get("websiteLink", "") or msg.get("websiteUrl", "") or msg.get("uri", "") or "",
     }
+    
+    # Also try parsing from description as fallback
+    if not any(socials_raw.values()) and desc:
+        parsed = parse_socials(desc)
+        if any(parsed.values()):
+            socials_raw = parsed
+    
+    # Debug: log ALL keys from first token to find social field names
+    if not hasattr(_process_token, '_debug_done'):
+        _process_token._debug_done = True
+        log.info(f"  -> [DEBUG] ALL WS keys: {list(msg.keys())}")
+        # Also log any values that look like URLs or socials
+        for k, v in msg.items():
+            if v and isinstance(v, str) and ("http" in str(v).lower() or "t.me" in str(v).lower() or "twitter" in str(v).lower() or "x.com" in str(v).lower()):
+                log.info(f"  -> [DEBUG] Social? {k} = {v[:80]}")
 
     if not mint or not name: return
     if len(mint) < 32 or len(mint) > 44: return
