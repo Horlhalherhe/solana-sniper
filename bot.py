@@ -150,7 +150,7 @@ NARRATIVE_CATEGORIES = {
         "copium", "hopium", "fud", "hodl", "wagmi", "ngmi",
         "wen", "ser", "gm", "frens", "anon", "degen",
         "rug", "yolo", "diamond hands", "paper hands", "moon",
-        "tendies", "apes", "retard",
+        "tendies", "apes", "retard", "cult",
     ],
     "politics_geo": [
         "trump", "maga", "biden", "whitehouse", "election", "vote",
@@ -740,13 +740,29 @@ def parse_socials(description: str) -> dict:
 def format_alert(token: dict, score: dict, narrative: dict) -> str:
     mint = token.get("mint", "")
     comps = score["components"]
-    lines = [
-        "🎯 <b>TekkiSniPer</b>", "",
-        f"<b>{token.get('name','?')}</b>  <code>${token.get('symbol','?')}</code>",
-        f"<code>{mint}</code>", "",
-        f"📊 <b>SCORE: {score['final_score']}/10</b>  {score['verdict']}",
-        f"<i>weights: narrative 15% | momentum 40% | timing 20% | safety 25%</i>", "",
-    ]
+    token_name = token.get('name', '?')
+    token_symbol = token.get('symbol', '?')
+    
+    # Detect CULT tokens — special treatment
+    is_cult = "cult" in f"{token_name} {token_symbol}".lower()
+    
+    if is_cult:
+        lines = [
+            "🔥🔥🔥 <b>TekkiSniPer — CULT ALERT</b> 🔥🔥🔥", "",
+            f"⚡ <b>CULT TOKEN DETECTED</b> ⚡", "",
+            f"<b>{token_name}</b>  <code>${token_symbol}</code>",
+            f"<code>{mint}</code>", "",
+            f"📊 <b>SCORE: {score['final_score']}/10</b>  {score['verdict']}",
+            f"<i>weights: narrative 15% | momentum 40% | timing 20% | safety 25%</i>", "",
+        ]
+    else:
+        lines = [
+            "🎯 <b>TekkiSniPer</b>", "",
+            f"<b>{token_name}</b>  <code>${token_symbol}</code>",
+            f"<code>{mint}</code>", "",
+            f"📊 <b>SCORE: {score['final_score']}/10</b>  {score['verdict']}",
+            f"<i>weights: narrative 15% | momentum 40% | timing 20% | safety 25%</i>", "",
+        ]
     
     if narrative["matched"]:
         lines.append(f"📡 Narrative:  <b>{narrative['keyword']}</b>  [{narrative['category']}]")
@@ -1756,6 +1772,28 @@ async def lifecycle_tracker(mint, name, symbol, deployer, desc, narrative, entry
                 checkpoints.append(snap)
                 
                 log.info(f"[LIFECYCLE] {symbol} @ {label}: mcap=${mcap_now:,.0f} ({current_x:.1f}X) holders={holders_now} vol=${vol_now:,.0f}")
+                
+                # ── 5min BUY SIGNAL — 94% of tokens at 1.5X+ at 5min become winners ──
+                if label == "5min" and current_x >= 1.5:
+                    mcap_change = int(((mcap_now - entry_mcap) / max(entry_mcap, 1)) * 100)
+                    signal_lines = [
+                        "🚨 <b>BUY SIGNAL — 5min confirmed</b>", "",
+                        f"<b>{name}</b>  <code>${symbol}</code>",
+                        f"<code>{mint}</code>", "",
+                        f"📈 <b>{current_x:.1f}X in 5 minutes</b> — 94% win rate",
+                        f"💰 MCap: ${entry_mcap:,.0f} → <b>${mcap_now:,.0f}</b> (+{mcap_change}%)",
+                        f"📈 Vol: <b>${vol_now:,.0f}</b>",
+                        f"👥 Holders: <b>{holders_now}</b>",
+                        f"💧 Liq: <b>${liq_now:,.0f}</b>",
+                        f"📊 Buy/Sell: <b>{buy_ratio_now:.1f}</b>", "",
+                        "⚡ <i>Based on pattern data: tokens at 1.5X+ at 5min hit 2X+ 94% of the time</i>", "",
+                        f"🔗 <a href='https://pump.fun/{mint}'>pump.fun</a>  "
+                        f"<a href='https://dexscreener.com/solana/{mint}'>dexscreener</a>  "
+                        f"<a href='https://gmgn.ai/sol/token/{mint}'>gmgn</a>",
+                        f"<i>🕐 {utcnow().strftime('%H:%M:%S UTC')}</i>",
+                    ]
+                    await send_tg("\n".join(signal_lines))
+                    log.info(f"[LIFECYCLE] 🚨 BUY SIGNAL: {symbol} at {current_x:.1f}X")
                 
             except Exception as e:
                 log.warning(f"[LIFECYCLE] {symbol} @ {label}: {e}")
