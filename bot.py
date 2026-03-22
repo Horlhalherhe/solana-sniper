@@ -1656,6 +1656,11 @@ async def _process_token(msg: dict):
     else:
         log.info(f"  -> Bonding curve — top10 filter skipped (BC inflates holder data)")
 
+    # ── Hard MCap floor — no alerts below $5k regardless of env vars ──────
+    if mcap < 5000 and liq < 5000:
+        log.info(f"  -> MCap ${mcap:,.0f} below $5k floor — skip")
+        return
+
     # ── Score ────────────────────────────────────────────────────────────────
     log.info(f"  -> ✅ PASSED FILTERS — dev={dev_pct:.1f}% top10={top10:.1f}% ({holders}h) — scoring")
     result = score_token(token, narrative)
@@ -1772,58 +1777,6 @@ async def lifecycle_tracker(mint, name, symbol, deployer, desc, narrative, entry
                 checkpoints.append(snap)
                 
                 log.info(f"[LIFECYCLE] {symbol} @ {label}: mcap=${mcap_now:,.0f} ({current_x:.1f}X) holders={holders_now} vol=${vol_now:,.0f}")
-                
-                # ── 5min BUY SIGNAL — tokens at 1.3X+ at 5min are strong winners ──
-                if label == "5min" and current_x >= 1.3:
-                    mcap_change = int(((mcap_now - entry_mcap) / max(entry_mcap, 1)) * 100)
-                    signal_lines = [
-                        "🚨 <b>BUY SIGNAL — 5min confirmed</b>", "",
-                        f"<b>{name}</b>  <code>${symbol}</code>",
-                        f"<code>{mint}</code>", "",
-                        f"📈 <b>{current_x:.1f}X in 5 minutes</b>",
-                        f"💰 MCap: ${entry_mcap:,.0f} → <b>${mcap_now:,.0f}</b> (+{mcap_change}%)",
-                        f"📈 Vol: <b>${vol_now:,.0f}</b>",
-                        f"👥 Holders: <b>{holders_now}</b>",
-                        f"💧 Liq: <b>${liq_now:,.0f}</b>",
-                        f"📊 Buy/Sell: <b>{buy_ratio_now:.1f}</b>", "",
-                        "⚡ <i>Pattern: tokens gaining at 5min are strong winners</i>", "",
-                        f"🔗 <a href='https://pump.fun/{mint}'>pump.fun</a>  "
-                        f"<a href='https://dexscreener.com/solana/{mint}'>dexscreener</a>  "
-                        f"<a href='https://gmgn.ai/sol/token/{mint}'>gmgn</a>",
-                        f"<i>🕐 {utcnow().strftime('%H:%M:%S UTC')}</i>",
-                    ]
-                    await send_tg("\n".join(signal_lines))
-                    log.info(f"[LIFECYCLE] 🚨 BUY SIGNAL: {symbol} at {current_x:.1f}X")
-                
-                # ── 15min BUY SIGNAL — slow builders that missed 5min trigger ──
-                if label == "15min" and current_x >= 1.5:
-                    # Only fire if 5min signal didn't already fire
-                    prev_5min = next((s for s in checkpoints if s.get("label") == "5min"), None)
-                    prev_x = prev_5min.get("x", 0) if prev_5min else 0
-                    if prev_x < 1.3:
-                        mcap_change = int(((mcap_now - entry_mcap) / max(entry_mcap, 1)) * 100)
-                        # Check volume is growing (key winner signal)
-                        prev_vol = prev_5min.get("vol", 0) if prev_5min else 0
-                        vol_growing = vol_now > prev_vol * 0.8 if prev_vol > 0 else True
-                        
-                        if vol_growing:
-                            signal_lines = [
-                                "🚨 <b>BUY SIGNAL — 15min slow builder</b>", "",
-                                f"<b>{name}</b>  <code>${symbol}</code>",
-                                f"<code>{mint}</code>", "",
-                                f"📈 <b>{current_x:.1f}X at 15 minutes</b> — growing steadily",
-                                f"💰 MCap: ${entry_mcap:,.0f} → <b>${mcap_now:,.0f}</b> (+{mcap_change}%)",
-                                f"📈 Vol: <b>${vol_now:,.0f}</b>",
-                                f"👥 Holders: <b>{holders_now}</b>",
-                                f"📊 Buy/Sell: <b>{buy_ratio_now:.1f}</b>", "",
-                                "⚡ <i>Pattern: slow build + volume holding = sustainable pump</i>", "",
-                                f"🔗 <a href='https://pump.fun/{mint}'>pump.fun</a>  "
-                                f"<a href='https://dexscreener.com/solana/{mint}'>dexscreener</a>  "
-                                f"<a href='https://gmgn.ai/sol/token/{mint}'>gmgn</a>",
-                                f"<i>🕐 {utcnow().strftime('%H:%M:%S UTC')}</i>",
-                            ]
-                            await send_tg("\n".join(signal_lines))
-                            log.info(f"[LIFECYCLE] 🚨 15min SIGNAL: {symbol} at {current_x:.1f}X (slow builder)")
                 
             except Exception as e:
                 log.warning(f"[LIFECYCLE] {symbol} @ {label}: {e}")
