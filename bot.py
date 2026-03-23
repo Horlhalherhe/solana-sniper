@@ -402,6 +402,80 @@ active_narratives: dict = {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TRENDING BURST DETECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+BURST_WINDOW = 300          # 5 minutes
+BURST_MIN_TOKENS = 3        # Need 3+ similar tokens to detect a burst
+BURST_ALERTED: Dict[str, float] = {}  # theme -> timestamp of last alert (avoid spam)
+
+# Recent tokens: list of (timestamp, name, symbol, mint, keywords)
+_recent_tokens: list = []
+_recent_lock = asyncio.Lock()
+
+# Common words to ignore when extracting keywords
+_STOP_WORDS = {
+    "the", "a", "an", "of", "for", "to", "in", "on", "is", "it", "my",
+    "and", "or", "but", "not", "no", "its", "new", "buy", "just", "your",
+    "this", "that", "with", "from", "are", "was", "has", "had", "get",
+    "got", "can", "will", "all", "one", "two", "you", "we", "he", "she",
+    "token", "coin", "sol", "solana", "pump", "fun", "pumpfun", "ca",
+    "bio", "check", "website", "hello", "look", "here", "bro", "sir",
+    "please", "lol", "lmao", "bruh", "wtf", "omg", "dev", "based",
+}
+
+def extract_theme_keywords(name: str, symbol: str) -> set:
+    """Extract meaningful keywords from a token name/symbol for burst matching."""
+    words = set()
+    combined = f"{name} {symbol}".lower()
+    # Split on non-alpha characters
+    for word in re.split(r'[^a-zA-Z]+', combined):
+        word = word.strip().lower()
+        if len(word) >= 3 and word not in _STOP_WORDS:
+            words.add(word)
+    return words
+
+def find_burst_theme(keywords: set) -> tuple:
+    """Check if these keywords match a current burst. Returns (theme, count) or (None, 0)."""
+    now = utcnow()
+    cutoff = now - timedelta(seconds=BURST_WINDOW)
+    
+    # Count how many recent tokens share keywords with this one
+    best_theme = None
+    best_count = 0
+    
+    # Group recent tokens by shared keywords
+    keyword_counts = defaultdict(int)
+    for ts, _, _, _, kws in _recent_tokens:
+        if ts < cutoff:
+            continue
+        shared = keywords & kws
+        for kw in shared:
+            keyword_counts[kw] += 1
+    
+    # Find the most common shared keyword
+    for kw, count in keyword_counts.items():
+        if count >= BURST_MIN_TOKENS - 1 and count > best_count:  # -1 because current token not yet added
+            best_count = count + 1  # Include current token
+            best_theme = kw
+    
+    return (best_theme, best_count) if best_theme else (None, 0)
+
+async def register_token_for_burst(name: str, symbol: str, mint: str):
+    """Register a token in the recent tokens list for burst detection."""
+    keywords = extract_theme_keywords(name, symbol)
+    if not keywords:
+        return
+    
+    now = utcnow()
+    async with _recent_lock:
+        _recent_tokens.append((now, name, symbol, mint, keywords))
+        # Cleanup old entries
+        cutoff = now - timedelta(seconds=BURST_WINDOW * 2)
+        while _recent_tokens and _recent_tokens[0][0] < cutoff:
+            _recent_tokens.pop(0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # PERSISTENCE
 # ═══════════════════════════════════════════════════════════════════════════════
 async def save_leaderboard():
@@ -818,6 +892,85 @@ def format_alert(token: dict, score: dict, narrative: dict) -> str:
             ws = f"https://{ws}"
         social_lines.append(f"🌐 <a href='{ws}'>Website</a>")
     
+    if social_lines:
+        lines.append("  ".join(social_lines))
+    else:
+        lines.append("⚠️ <i>No socials found</i>")
+    
+    lines.append(f"<i>🕐 {utcnow().strftime('%H:%M:%S UTC')}</i>")
+    
+    return "\n".join(lines)
+
+
+def format_trending_alert(token: dict, score: dict, narrative: dict, theme: str, count: int, is_first: bool) -> str:
+    mint = token.get("mint", "")
+    comps = score["components"]
+    token_name = token.get('name', '?')
+    token_symbol = token.get('symbol', '?')
+    
+    # Also check for cult
+    is_cult = "cult" in f"{token_name} {token_symbol}".lower()
+    
+    if is_first:
+        header = f"🔥🔥 <b>TRENDING ALERT — viral event detected</b> 🔥🔥"
+    else:
+        header = f"🔥 <b>TRENDING — {theme.upper()}</b>"
+    
+    lines = [
+        header, "",
+        f"📡 <b>{count} tokens with '{theme}' in last 5min — something is trending</b>",
+    ]
+    
+    if is_first:
+        lines.append("⚡ <b>FIRST MOVER WITH TRACTION</b>")
+    
+    if is_cult:
+        lines.append("🔥 <b>CULT TOKEN</b>")
+    
+    lines += [
+        "",
+        f"<b>{token_name}</b>  <code>${token_symbol}</code>",
+        f"<code>{mint}</code>", "",
+        f"📊 <b>SCORE: {score['final_score']}/10</b>  {score['verdict']}",
+        "",
+    ]
+    
+    if narrative["matched"]:
+        lines.append(f"📡 Narrative:  <b>{narrative['keyword']}</b>  [{narrative['category']}]")
+    
+    lines += [
+        f"💰 MCap:       <b>${token.get('mcap_usd', 0):,.0f}</b>",
+        f"💧 Liquidity:  <b>${token.get('liquidity_usd', 0):,.0f}</b>",
+        f"👥 Holders:    <b>{token.get('total_holders', 0)}</b>",
+        f"📈 Vol 1h:     <b>${token.get('volume_1h_usd', 0):,.0f}</b>",
+        f"👨‍💻 Dev holds:  <b>{token.get('dev_holds_pct', 0):.1f}%</b>",
+        "",
+        f"🔗 <a href='https://pump.fun/{mint}'>pump.fun</a>  "
+        f"<a href='https://dexscreener.com/solana/{mint}'>dexscreener</a>  "
+        f"<a href='https://gmgn.ai/sol/token/{mint}'>gmgn</a>  "
+        f"<a href='https://solscan.io/token/{mint}'>solscan</a>",
+    ]
+    
+    # Social links
+    socials = token.get("socials", {})
+    if not any(socials.values()):
+        socials = parse_socials(token.get("description", ""))
+    social_lines = []
+    if socials.get("twitter"):
+        tw = socials["twitter"]
+        if not tw.startswith("http"):
+            tw = f"https://x.com/{tw}"
+        social_lines.append(f"🐦 <a href='{tw}'>X / Twitter</a>")
+    if socials.get("telegram"):
+        tg = socials["telegram"]
+        if not tg.startswith("http"):
+            tg = f"https://t.me/{tg}"
+        social_lines.append(f"💬 <a href='{tg}'>Telegram</a>")
+    if socials.get("website"):
+        ws = socials["website"]
+        if not ws.startswith("http"):
+            ws = f"https://{ws}"
+        social_lines.append(f"🌐 <a href='{ws}'>Website</a>")
     if social_lines:
         lines.append("  ".join(social_lines))
     else:
@@ -1543,6 +1696,9 @@ async def _process_token(msg: dict):
 
     log.info(f"[NEW] {name} (${symbol}) {mint[:12]}...")
 
+    # Register for burst detection (before any filters)
+    await register_token_for_burst(name, symbol, mint)
+
     # ── Narrative match (optional — boosts score but not required) ──────────
     narrative = match_narrative(name, symbol, desc)
     if narrative["matched"]:
@@ -1674,10 +1830,36 @@ async def _process_token(msg: dict):
             socials_raw = await fetch_token_socials(token_uri)
         token["socials"] = socials_raw
         
+        # Check if this token is part of a trending burst
+        keywords = extract_theme_keywords(name, symbol)
+        burst_theme, burst_count = (None, 0)
+        if keywords:
+            async with _recent_lock:
+                burst_theme, burst_count = find_burst_theme(keywords)
+        
+        is_trending = burst_theme and burst_count >= BURST_MIN_TOKENS
+        
         async with alerts_lock:
             total_alerts_fired += 1
-        log.info(f"  🎯 FIRING — {name} (${symbol})")
-        await send_tg(format_alert(token, result, narrative))
+        
+        if is_trending:
+            # Check if we already sent a trending alert for this theme recently
+            now_ts = utcnow().timestamp()
+            last_alerted = BURST_ALERTED.get(burst_theme, 0)
+            is_first_trending = (now_ts - last_alerted) > BURST_WINDOW
+            
+            if is_first_trending:
+                BURST_ALERTED[burst_theme] = now_ts
+                # Cleanup old burst alerts
+                old_themes = [k for k, v in BURST_ALERTED.items() if now_ts - v > 3600]
+                for k in old_themes:
+                    del BURST_ALERTED[k]
+            
+            log.info(f"  🔥 TRENDING — {name} (${symbol}) — theme: {burst_theme} ({burst_count} tokens)")
+            await send_tg(format_trending_alert(token, result, narrative, burst_theme, burst_count, is_first_trending))
+        else:
+            log.info(f"  🎯 FIRING — {name} (${symbol})")
+            await send_tg(format_alert(token, result, narrative))
 
         # Track — entry_mcap must be at least MIN_MCAP to avoid fake X multipliers
         entry_mcap = mcap if mcap >= MIN_MCAP else liq if liq >= 1000 else mcap
