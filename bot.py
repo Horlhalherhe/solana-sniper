@@ -404,9 +404,14 @@ active_narratives: dict = {}
 # ═══════════════════════════════════════════════════════════════════════════════
 # TRENDING BURST DETECTION
 # ═══════════════════════════════════════════════════════════════════════════════
-BURST_WINDOW = 300          # 5 minutes
+BURST_WINDOW = 300          # 5 minutes to detect burst
 BURST_MIN_TOKENS = 3        # Need 3+ similar tokens to detect a burst
 BURST_ALERTED: Dict[str, float] = {}  # theme -> timestamp of last alert (avoid spam)
+BURST_EVAL_DELAY = 600      # 10 minutes — wait for candidates before picking winner
+
+# Burst candidates: theme -> list of {mint, name, symbol, token, score, narrative, ...}
+_burst_candidates: Dict[str, list] = {}
+_burst_evaluating: Dict[str, bool] = {}  # theme -> True if evaluator already started
 
 # Recent tokens: list of (timestamp, name, symbol, mint, keywords)
 _recent_tokens: list = []
@@ -473,6 +478,233 @@ async def register_token_for_burst(name: str, symbol: str, mint: str):
         cutoff = now - timedelta(seconds=BURST_WINDOW * 2)
         while _recent_tokens and _recent_tokens[0][0] < cutoff:
             _recent_tokens.pop(0)
+
+
+async def burst_evaluator(theme: str, count: int):
+    """Wait 10 minutes, then pick the best candidate from a trending burst."""
+    global total_alerts_fired
+    try:
+        log.info(f"[BURST] Evaluating '{theme}' — waiting {BURST_EVAL_DELAY}s for candidates...")
+        await asyncio.sleep(BURST_EVAL_DELAY)
+        
+        candidates = _burst_candidates.get(theme, [])
+        if not candidates:
+            log.info(f"[BURST] '{theme}' — no candidates after wait")
+            return
+        
+        log.info(f"[BURST] '{theme}' — evaluating {len(candidates)} candidates")
+        
+        # Re-check each candidate on DexScreener for current data
+        best = None
+        best_score = -1
+        
+        for cand in candidates:
+            try:
+                mint = cand["mint"]
+                dex = await fetch_dexscreener(mint)
+                
+                current_mcap = dex.get("mcap_usd", 0)
+                current_liq = dex.get("liquidity_usd", 0)
+                current_vol = dex.get("volume_1h_usd", 0)
+                dex_paid = dex.get("dex_paid", False)
+                boosts = dex.get("boosts", 0)
+                buy_ratio = dex.get("buy_sell_ratio_1h", 1.0)
+                price_change = dex.get("price_change_1h_pct", 0)
+                
+                # Skip dead tokens
+                if current_mcap < 3000 and current_liq < 1000:
+                    log.info(f"  [BURST] {cand['symbol']} — dead (mcap=${current_mcap:,.0f})")
+                    continue
+                
+                # Score candidates — organic growth matters most when multiple have dex_paid
+                eval_score = 0
+                
+                # Tier 1: Dex paid + boosts (entry ticket)
+                if dex_paid:
+                    eval_score += 30
+                if boosts > 0:
+                    eval_score += min(boosts * 5, 20)
+                
+                # Tier 2: Real liquidity (migrated to Raydium = graduated)
+                if current_liq > 0:
+                    eval_score += 25
+                    eval_score += min(current_liq / 1000, 25)  # More liq = better
+                
+                # Tier 3: MCap traction (THE key differentiator)
+                eval_score += min(current_mcap / 500, 60)  # Up to 60 points for $30k+
+                
+                # Tier 4: Volume relative to mcap (organic trading activity)
+                if current_mcap > 0:
+                    vol_mcap_ratio = current_vol / current_mcap
+                    eval_score += min(vol_mcap_ratio * 20, 40)  # High vol/mcap = active
+                
+                # Tier 5: Buy pressure (still being bought = organic)
+                if buy_ratio > 2.0:
+                    eval_score += 20
+                elif buy_ratio > 1.5:
+                    eval_score += 10
+                elif buy_ratio < 0.8:
+                    eval_score -= 15  # Being dumped
+                
+                # Tier 6: Price trend (positive = momentum)
+                if price_change > 50:
+                    eval_score += 15
+                elif price_change > 20:
+                    eval_score += 10
+                elif price_change < -30:
+                    eval_score -= 20  # Crashing
+                
+                # Tier 7: MCap growth from entry
+                entry_mcap_cand = cand.get("token", {}).get("mcap_usd", 5000)
+                if entry_mcap_cand > 0 and current_mcap > entry_mcap_cand:
+                    growth = current_mcap / entry_mcap_cand
+                    eval_score += min(growth * 10, 30)  # Growing from entry
+                
+                log.info(f"  [BURST] {cand['symbol']} — mcap=${current_mcap:,.0f} liq=${current_liq:,.0f} vol=${current_vol:,.0f} b/s={buy_ratio:.1f} dex={dex_paid} boosts={boosts} → eval={eval_score:.0f}")
+                
+                # Update candidate with fresh data
+                cand["current_mcap"] = current_mcap
+                cand["current_liq"] = current_liq
+                cand["current_vol"] = current_vol
+                cand["dex_paid"] = dex_paid
+                cand["boosts"] = boosts
+                cand["buy_ratio"] = buy_ratio
+                cand["price_change"] = price_change
+                cand["eval_score"] = eval_score
+                
+                if eval_score > best_score:
+                    best_score = eval_score
+                    best = cand
+                
+                await asyncio.sleep(0.3)  # Rate limit
+            except Exception as e:
+                log.warning(f"  [BURST] Eval error for {cand.get('symbol','?')}: {e}")
+        
+        if not best:
+            log.info(f"[BURST] '{theme}' — no viable candidates after evaluation")
+            return
+        
+        # Build and send trending alert for the winner
+        token_data = best.get("token", {})
+        token_data["mcap_usd"] = best.get("current_mcap", token_data.get("mcap_usd", 0))
+        token_data["liquidity_usd"] = best.get("current_liq", token_data.get("liquidity_usd", 0))
+        token_data["volume_1h_usd"] = best.get("current_vol", token_data.get("volume_1h_usd", 0))
+        
+        # Add dex_paid info
+        dex_paid = best.get("dex_paid", False)
+        boosts = best.get("boosts", 0)
+        
+        result = best.get("result", {})
+        narrative = best.get("narrative", {})
+        mint = best["mint"]
+        name = best["name"]
+        symbol = best["symbol"]
+        
+        async with alerts_lock:
+            global total_alerts_fired
+            total_alerts_fired += 1
+        
+        # Format special trending winner alert
+        lines = [
+            "🔥🔥 <b>TRENDING WINNER — evaluated & confirmed</b> 🔥🔥", "",
+            f"📡 <b>{len(candidates)} tokens with '{theme}' — THIS ONE LEADS</b>",
+        ]
+        
+        if dex_paid:
+            lines.append("💎 <b>DEX PAID — profile active</b>")
+        if boosts > 0:
+            lines.append(f"🚀 <b>{boosts} DexScreener boosts</b>")
+        if best.get("current_liq", 0) > 0:
+            lines.append("🎓 <b>MIGRATED — has real liquidity</b>")
+        
+        is_cult = "cult" in f"{name} {symbol}".lower()
+        if is_cult:
+            lines.append("🔥 <b>CULT TOKEN</b>")
+        
+        lines += [
+            "",
+            f"<b>{name}</b>  <code>${symbol}</code>",
+            f"<code>{mint}</code>", "",
+            f"📊 <b>SCORE: {result.get('final_score', 0)}/10</b>  {result.get('verdict', '')}",
+            "",
+        ]
+        
+        if narrative.get("matched"):
+            lines.append(f"📡 Narrative:  <b>{narrative.get('keyword','')}</b>  [{narrative.get('category','')}]")
+        
+        lines += [
+            f"💰 MCap:       <b>${best.get('current_mcap', 0):,.0f}</b>",
+            f"💧 Liquidity:  <b>${best.get('current_liq', 0):,.0f}</b>",
+            f"📈 Vol 1h:     <b>${best.get('current_vol', 0):,.0f}</b>",
+            f"📊 Buy/Sell:   <b>{best.get('buy_ratio', 1.0):.1f}</b>",
+            f"👨‍💻 Dev holds:  <b>{token_data.get('dev_holds_pct', 0):.1f}%</b>",
+            f"🏆 Eval score: <b>{best.get('eval_score', 0):.0f}</b>",
+            "",
+            f"🔗 <a href='https://pump.fun/{mint}'>pump.fun</a>  "
+            f"<a href='https://dexscreener.com/solana/{mint}'>dexscreener</a>  "
+            f"<a href='https://gmgn.ai/sol/token/{mint}'>gmgn</a>  "
+            f"<a href='https://solscan.io/token/{mint}'>solscan</a>",
+        ]
+        
+        # Socials
+        socials = token_data.get("socials", {})
+        social_lines = []
+        if socials.get("twitter"):
+            tw = socials["twitter"]
+            if not tw.startswith("http"): tw = f"https://x.com/{tw}"
+            social_lines.append(f"🐦 <a href='{tw}'>X / Twitter</a>")
+        if socials.get("telegram"):
+            tg = socials["telegram"]
+            if not tg.startswith("http"): tg = f"https://t.me/{tg}"
+            social_lines.append(f"💬 <a href='{tg}'>Telegram</a>")
+        if socials.get("website"):
+            ws = socials["website"]
+            if not ws.startswith("http"): ws = f"https://{ws}"
+            social_lines.append(f"🌐 <a href='{ws}'>Website</a>")
+        if social_lines:
+            lines.append("  ".join(social_lines))
+        
+        # Show other candidates that lost
+        losers = [c for c in candidates if c["mint"] != mint]
+        if losers:
+            lines.append("")
+            lines.append(f"<i>Rejected {len(losers)} others:</i>")
+            for l in sorted(losers, key=lambda x: x.get("eval_score", 0), reverse=True)[:3]:
+                l_mcap = l.get("current_mcap", 0)
+                l_paid = "💎dex" if l.get("dex_paid") else ""
+                l_liq = "🎓migrated" if l.get("current_liq", 0) > 0 else ""
+                l_br = l.get("buy_ratio", 0)
+                l_score = l.get("eval_score", 0)
+                lines.append(f"  <i>{l.get('name','?')} — ${l_mcap:,.0f} b/s:{l_br:.1f} {l_paid} {l_liq} (eval:{l_score:.0f})</i>")
+        
+        lines.append(f"<i>🕐 {utcnow().strftime('%H:%M:%S UTC')}</i>")
+        
+        await send_tg("\n".join(lines))
+        log.info(f"[BURST] ✅ Winner: {name} (${symbol}) — mcap=${best.get('current_mcap',0):,.0f} dex_paid={dex_paid}")
+        
+        # Track the winner
+        entry_mcap = max(best.get("current_mcap", MIN_MCAP), MIN_MCAP)
+        async with tracked_lock:
+            t = TrackedToken(
+                mint=mint, name=name, symbol=symbol,
+                entry_mcap=entry_mcap, entry_score=result.get("final_score", 0),
+                narrative=narrative.get("keyword", "?"),
+            )
+            t.has_socials = bool(socials.get("twitter") or socials.get("telegram") or socials.get("website"))
+            tracked[mint] = t
+        asyncio.create_task(save_leaderboard())
+        
+        # Start lifecycle for winner
+        deployer = best.get("deployer", "")
+        desc = best.get("desc", "")
+        asyncio.create_task(lifecycle_tracker(mint, name, symbol, deployer, desc, narrative, entry_mcap, result.get("final_score", 0)))
+        
+    except Exception as e:
+        log.error(f"[BURST] Evaluator error for '{theme}': {e}")
+    finally:
+        # Cleanup
+        _burst_candidates.pop(theme, None)
+        _burst_evaluating.pop(theme, None)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -570,6 +802,13 @@ async def fetch_dexscreener(mint: str) -> dict:
             pairs = resp.json().get("pairs") or []
             if not pairs: return {}
             pair = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
+            
+            # Check for DexScreener paid/boosted indicators
+            boosts = pair.get("boosts", 0) or 0
+            has_profile = bool(pair.get("profile") or pair.get("header") or pair.get("links"))
+            info = pair.get("info") or {}
+            has_dex_paid = bool(info.get("imageUrl") or info.get("websites") or info.get("socials") or boosts > 0 or has_profile)
+            
             return {
                 "liquidity_usd":       float((pair.get("liquidity") or {}).get("usd") or 0),
                 "mcap_usd":            float(pair.get("marketCap") or pair.get("fdv") or 0),
@@ -579,6 +818,8 @@ async def fetch_dexscreener(mint: str) -> dict:
                 "buy_sell_ratio_1h":   int((pair.get("txns") or {}).get("h1", {}).get("buys") or 1) /
                                        max(int((pair.get("txns") or {}).get("h1", {}).get("sells") or 1), 1),
                 "total_holders":       int(pair.get("holders", 50)),
+                "dex_paid":            has_dex_paid,
+                "boosts":              int(boosts),
             }
     except Exception as e:
         log.warning(f"[DexScreener] {mint[:12]}: {e}")
@@ -1839,25 +2080,41 @@ async def _process_token(msg: dict):
         
         is_trending = burst_theme and burst_count >= BURST_MIN_TOKENS
         
-        async with alerts_lock:
-            total_alerts_fired += 1
-        
         if is_trending:
-            # Check if we already sent a trending alert for this theme recently
+            # Store as candidate — evaluator will pick the best one later
             now_ts = utcnow().timestamp()
             last_alerted = BURST_ALERTED.get(burst_theme, 0)
-            is_first_trending = (now_ts - last_alerted) > BURST_WINDOW
             
-            if is_first_trending:
+            # Don't accept candidates if we already evaluated this theme recently
+            if (now_ts - last_alerted) < BURST_WINDOW * 2:
+                log.info(f"  -> Trending '{burst_theme}' already evaluated recently — skip")
+                return
+            
+            candidate = {
+                "mint": mint, "name": name, "symbol": symbol,
+                "deployer": deployer, "desc": desc,
+                "token": dict(token), "result": dict(result), "narrative": dict(narrative),
+                "socials_raw": socials_raw, "token_uri": token_uri,
+                "added_at": utcnow().isoformat(),
+            }
+            
+            if burst_theme not in _burst_candidates:
+                _burst_candidates[burst_theme] = []
+            _burst_candidates[burst_theme].append(candidate)
+            
+            log.info(f"  -> Trending candidate '{burst_theme}' — {len(_burst_candidates[burst_theme])} candidates queued")
+            
+            # Start evaluator if not already running for this theme
+            if burst_theme not in _burst_evaluating:
+                _burst_evaluating[burst_theme] = True
                 BURST_ALERTED[burst_theme] = now_ts
-                # Cleanup old burst alerts
-                old_themes = [k for k, v in BURST_ALERTED.items() if now_ts - v > 3600]
-                for k in old_themes:
-                    del BURST_ALERTED[k]
+                asyncio.create_task(burst_evaluator(burst_theme, burst_count))
+                log.info(f"  -> Burst evaluator started for '{burst_theme}' — will pick winner in {BURST_EVAL_DELAY}s")
             
-            log.info(f"  🔥 TRENDING — {name} (${symbol}) — theme: {burst_theme} ({burst_count} tokens)")
-            await send_tg(format_trending_alert(token, result, narrative, burst_theme, burst_count, is_first_trending))
+            return  # Don't send normal alert — evaluator will handle it
         else:
+            async with alerts_lock:
+                total_alerts_fired += 1
             log.info(f"  🎯 FIRING — {name} (${symbol})")
             await send_tg(format_alert(token, result, narrative))
 
