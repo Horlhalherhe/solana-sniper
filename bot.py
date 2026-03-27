@@ -1935,6 +1935,11 @@ async def _process_token(msg: dict):
     if not mint or not name: return
     if len(mint) < 32 or len(mint) > 44: return
 
+    # Skip Mayhem Mode tokens — extreme volatility, almost always rugs
+    if msg.get("is_mayhem_mode"):
+        log.info(f"[NEW] {name} (${symbol}) {mint[:12]}... -> ⚠️ MAYHEM MODE — skip")
+        return
+
     log.info(f"[NEW] {name} (${symbol}) {mint[:12]}...")
 
     # Register for burst detection (before any filters)
