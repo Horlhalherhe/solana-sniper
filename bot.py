@@ -400,6 +400,37 @@ bot_start_time: datetime = utcnow()
 total_alerts_fired: int = 0
 active_narratives: dict = {}
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SCALP PATTERNS — tokens matching these pump & dump predictably
+# ═══════════════════════════════════════════════════════════════════════════════
+SCALP_FILE = DATA_DIR / "scalp_patterns.json"
+
+def load_scalp_patterns() -> list:
+    try:
+        if SCALP_FILE.exists():
+            with open(SCALP_FILE) as f:
+                data = json.load(f)
+            return [p.lower().strip() for p in data if isinstance(p, str)]
+    except Exception:
+        pass
+    return ["act"]  # Default: "Act" series tokens
+
+def save_scalp_patterns(patterns: list):
+    try:
+        SCALP_FILE.write_text(json.dumps(patterns, indent=2))
+    except Exception as e:
+        log.error(f"[SCALP] Save error: {e}")
+
+scalp_patterns: list = load_scalp_patterns()
+
+def is_scalp_token(name: str, symbol: str) -> tuple:
+    """Check if token matches a known pump & dump pattern. Returns (matched, pattern)."""
+    combined = f"{name} {symbol}".lower()
+    for pat in scalp_patterns:
+        if re.search(r'\b' + re.escape(pat) + r'\b', combined):
+            return (True, pat)
+    return (False, None)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TRENDING BURST DETECTION
@@ -1061,10 +1092,23 @@ def format_alert(token: dict, score: dict, narrative: dict) -> str:
     # Detect CULT tokens — special treatment
     is_cult = "cult" in f"{token_name} {token_symbol}".lower()
     
+    # Detect SCALP pattern tokens — known pump & dump patterns
+    scalp_match, scalp_pat = is_scalp_token(token_name, token_symbol)
+    
     if is_cult:
         lines = [
             "🔥🔥🔥 <b>TekkiSniPer — CULT ALERT</b> 🔥🔥🔥", "",
             f"⚡ <b>CULT TOKEN DETECTED</b> ⚡", "",
+            f"<b>{token_name}</b>  <code>${token_symbol}</code>",
+            f"<code>{mint}</code>", "",
+            f"📊 <b>SCORE: {score['final_score']}/10</b>  {score['verdict']}",
+            f"<i>weights: narrative 15% | momentum 40% | timing 20% | safety 25%</i>", "",
+        ]
+    elif scalp_match:
+        lines = [
+            "⚡ <b>TekkiSniPer — SCALP ALERT</b> ⚡", "",
+            f"🎰 <b>PUMP & DUMP PATTERN: '{scalp_pat}'</b>",
+            f"<i>Known to pump 5-10X then rug — quick flip only, take profit fast</i>", "",
             f"<b>{token_name}</b>  <code>${token_symbol}</code>",
             f"<code>{mint}</code>", "",
             f"📊 <b>SCORE: {score['final_score']}/10</b>  {score['verdict']}",
@@ -1329,6 +1373,10 @@ def format_help() -> str:
         "/analytics7   — last 7 day report",
         "/analytics30  — last 30 day report",
         "/patterns     — win vs loss patterns",
+        "/scalp        — view scalp patterns",
+        "/scalpadd X   — add scalp pattern",
+        "/scalprem X   — remove scalp pattern",
+        "/topx N       — tokens that hit NX+",
         "/help         — this menu",
     ])
 
@@ -1804,6 +1852,113 @@ async def handle_commands():
             except Exception:
                 pass
 
+    async def send_scalp_list(cid):
+        if not scalp_patterns:
+            await send_tg("🎰 No scalp patterns set. Use /scalpadd <word> to add one.", cid)
+            return
+        msg = "🎰 <b>SCALP PATTERNS</b>\n\n"
+        msg += "Tokens matching these are flagged as pump & dump:\n\n"
+        for i, pat in enumerate(scalp_patterns, 1):
+            msg += f"  {i}. <b>{pat}</b>\n"
+        msg += f"\nTotal: {len(scalp_patterns)} patterns\n"
+        msg += "\n/scalpadd <word> — add pattern\n/scalprem <word> — remove pattern"
+        await send_tg(msg, cid)
+    
+    async def send_scalp_add(cid, word):
+        word = word.lower().strip()
+        if not word or len(word) < 2:
+            await send_tg("⚠️ Pattern too short. Use: /scalpadd <word>", cid)
+            return
+        if word in scalp_patterns:
+            await send_tg(f"⚠️ '{word}' already in scalp patterns.", cid)
+            return
+        scalp_patterns.append(word)
+        save_scalp_patterns(scalp_patterns)
+        await send_tg(f"✅ Added '<b>{word}</b>' to scalp patterns.\n\nNow tracking {len(scalp_patterns)} patterns.", cid)
+        log.info(f"[SCALP] Added pattern: {word}")
+    
+    async def send_scalp_remove(cid, word):
+        word = word.lower().strip()
+        if word in scalp_patterns:
+            scalp_patterns.remove(word)
+            save_scalp_patterns(scalp_patterns)
+            await send_tg(f"✅ Removed '<b>{word}</b>' from scalp patterns.\n\n{len(scalp_patterns)} patterns remaining.", cid)
+            log.info(f"[SCALP] Removed pattern: {word}")
+        else:
+            await send_tg(f"⚠️ '{word}' not found in scalp patterns.\nUse /scalp to see current list.", cid)
+    
+    async def send_topx(cid, min_x):
+        try:
+            min_x = float(min_x)
+        except Exception:
+            await send_tg("⚠️ Usage: /topx <number>\nExample: /topx 5", cid)
+            return
+        
+        # Collect from tracked + history
+        all_tokens = []
+        try:
+            async with tracked_lock:
+                for t in tracked.values():
+                    px = float(getattr(t, 'peak_x', 1.0))
+                    if px >= min_x:
+                        all_tokens.append({
+                            "name": getattr(t, 'name', '?'),
+                            "symbol": getattr(t, 'symbol', '?'),
+                            "mint": getattr(t, 'mint', ''),
+                            "peak_x": px,
+                            "entry_mcap": getattr(t, 'entry_mcap', 0),
+                            "entry_score": getattr(t, 'entry_score', 0),
+                            "status": "active",
+                        })
+        except Exception:
+            pass
+        try:
+            async with history_lock:
+                for r in leaderboard_history:
+                    px = float(r.get("peak_x", 1.0))
+                    if px >= min_x:
+                        all_tokens.append({
+                            "name": r.get("name", "?"),
+                            "symbol": r.get("symbol", "?"),
+                            "mint": r.get("mint", ""),
+                            "peak_x": px,
+                            "entry_mcap": r.get("entry_mcap", 0),
+                            "entry_score": r.get("entry_score", 0),
+                            "status": r.get("status", "closed"),
+                        })
+        except Exception:
+            pass
+        
+        if not all_tokens:
+            await send_tg(f"📊 No tokens found with {min_x}X+ peak.", cid)
+            return
+        
+        sorted_tokens = sorted(all_tokens, key=lambda x: x["peak_x"], reverse=True)[:15]
+        
+        msg = f"📊 <b>TOKENS THAT HIT {min_x:.0f}X+</b>\n"
+        msg += f"<i>{len(all_tokens)} total</i>\n\n"
+        
+        medals = ["🥇", "🥈", "🥉"]
+        for i, t in enumerate(sorted_tokens):
+            m = medals[i] if i < 3 else f"{i+1}."
+            status = "🟢" if t["status"] == "active" else "⚪"
+            mint = t["mint"]
+            msg += f"{m} <b>{t['name']}</b> ${t['symbol']} {status}\n"
+            msg += f"   Peak: <b>{t['peak_x']:.1f}X</b>  |  Entry: ${t['entry_mcap']:,.0f}  |  Score: {t['entry_score']:.1f}\n"
+            if mint:
+                msg += f"   <a href='https://dexscreener.com/solana/{mint}'>dex</a>  <a href='https://pump.fun/{mint}'>pump</a>\n"
+            msg += "\n"
+        
+        if len(msg) > 4000:
+            mid = msg.rfind("\n\n", 0, 4000)
+            if mid > 0:
+                await send_tg(msg[:mid], cid)
+                await send_tg(msg[mid:], cid)
+            else:
+                await send_tg(msg[:4000], cid)
+        else:
+            await send_tg(msg, cid)
+
     commands = {
         '/status':      lambda cid: send_tg(format_status(), cid),
         '/leaderboard': lambda cid: send_lb(cid, 1),
@@ -1816,7 +1971,15 @@ async def handle_commands():
         '/analytics7':  lambda cid: send_analytics(cid, 7),
         '/analytics30': lambda cid: send_analytics(cid, 30),
         '/patterns':    lambda cid: send_patterns(cid),
+        '/scalp':       lambda cid: send_scalp_list(cid),
         '/help':        lambda cid: send_tg(format_help(), cid),
+    }
+    
+    # Commands that take arguments
+    arg_commands = {
+        '/scalpadd': send_scalp_add,
+        '/scalprem': send_scalp_remove,
+        '/topx':     send_topx,
     }
 
     while True:
@@ -1837,6 +2000,10 @@ async def handle_commands():
                 try:
                     if cmd in commands:
                         await commands[cmd](cid)
+                    elif cmd in arg_commands:
+                        parts = text.split(maxsplit=1)
+                        arg = parts[1].strip() if len(parts) > 1 else ""
+                        await arg_commands[cmd](cid, arg)
                     else:
                         await send_tg(f"❓ Unknown: {cmd}\nTry /help", cid)
                 except Exception as cmd_err:
