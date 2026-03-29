@@ -433,6 +433,138 @@ def is_scalp_token(name: str, symbol: str) -> tuple:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# PAPER TRADING — auto-trade every alert, track P&L
+# ═══════════════════════════════════════════════════════════════════════════════
+PAPER_FILE = DATA_DIR / "paper_trades.json"
+PAPER_SOL_PER_TRADE = float(os.getenv("PAPER_SOL_PER_TRADE", "1.0"))
+PAPER_TP1_X = 5.0    # Take 80% profit at 5X
+PAPER_TP1_PCT = 0.80  # Sell 80% at TP1
+PAPER_TP2_X = 10.0   # Sell remaining 20% at 10X
+PAPER_SL_X = 0.5     # Stop loss at -50%
+
+paper_trades: List[dict] = []
+paper_lock = asyncio.Lock()
+
+def load_paper_trades():
+    global paper_trades
+    try:
+        if PAPER_FILE.exists():
+            with open(PAPER_FILE) as f:
+                paper_trades = json.load(f)
+            log.info(f"[PAPER] Loaded {len(paper_trades)} trades")
+    except Exception as e:
+        log.error(f"[PAPER] Load error: {e}")
+
+async def save_paper_trades():
+    try:
+        async with paper_lock:
+            data = list(paper_trades)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None, lambda: PAPER_FILE.write_text(json.dumps(data, indent=2)))
+    except Exception as e:
+        log.error(f"[PAPER] Save error: {e}")
+
+def paper_buy(mint: str, name: str, symbol: str, entry_mcap: float, score: float, alert_type: str = "normal"):
+    """Record a paper buy."""
+    trade = {
+        "mint": mint,
+        "name": name,
+        "symbol": symbol,
+        "entry_mcap": entry_mcap,
+        "entry_score": score,
+        "entry_sol": PAPER_SOL_PER_TRADE,
+        "alert_type": alert_type,  # normal, cult, scalp, trending
+        "status": "open",          # open, tp1, closed
+        "sol_remaining": PAPER_SOL_PER_TRADE,
+        "sol_realized": 0.0,
+        "current_mcap": entry_mcap,
+        "current_x": 1.0,
+        "peak_x": 1.0,
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "sl_hit": False,
+        "opened_at": utcnow().isoformat(),
+        "closed_at": None,
+    }
+    paper_trades.append(trade)
+    log.info(f"[PAPER] BUY {symbol} @ ${entry_mcap:,.0f} — 1 SOL ({alert_type})")
+    return trade
+
+def paper_update_price(mint: str, current_mcap: float) -> list:
+    """Update price and execute TP/SL. Returns list of messages to send."""
+    messages = []
+    for trade in paper_trades:
+        if trade["mint"] != mint or trade["status"] == "closed":
+            continue
+        
+        entry_mcap = trade["entry_mcap"]
+        if entry_mcap <= 0:
+            continue
+        
+        current_x = min(current_mcap / entry_mcap, 500)
+        trade["current_mcap"] = current_mcap
+        trade["current_x"] = round(current_x, 2)
+        trade["peak_x"] = max(trade["peak_x"], current_x)
+        
+        name = trade["name"]
+        symbol = trade["symbol"]
+        
+        # ── Stop Loss: -50% ──
+        if current_x <= PAPER_SL_X and not trade["sl_hit"]:
+            trade["sl_hit"] = True
+            sol_lost = trade["sol_remaining"] * current_x
+            trade["sol_realized"] += sol_lost
+            trade["sol_remaining"] = 0
+            trade["status"] = "closed"
+            trade["closed_at"] = utcnow().isoformat()
+            pnl = trade["sol_realized"] - trade["entry_sol"]
+            messages.append(
+                f"🔴 <b>PAPER STOP LOSS</b>\n\n"
+                f"<b>{name}</b> ${symbol}\n"
+                f"Entry: ${entry_mcap:,.0f} → ${current_mcap:,.0f} ({current_x:.2f}X)\n"
+                f"💰 Sold all at -50% → <b>{pnl:+.2f} SOL</b>"
+            )
+            log.info(f"[PAPER] SL {symbol} @ {current_x:.2f}X — P&L: {pnl:+.2f} SOL")
+        
+        # ── Take Profit 1: 5X → sell 80% ──
+        elif current_x >= PAPER_TP1_X and not trade["tp1_hit"]:
+            trade["tp1_hit"] = True
+            sell_amount = trade["entry_sol"] * PAPER_TP1_PCT
+            sol_out = sell_amount * current_x
+            trade["sol_realized"] += sol_out
+            trade["sol_remaining"] = trade["entry_sol"] * (1 - PAPER_TP1_PCT)
+            trade["status"] = "tp1"
+            messages.append(
+                f"🟢 <b>PAPER TAKE PROFIT 1 (5X)</b>\n\n"
+                f"<b>{name}</b> ${symbol}\n"
+                f"Entry: ${entry_mcap:,.0f} → ${current_mcap:,.0f} ({current_x:.1f}X)\n"
+                f"💰 Sold 80% → <b>+{sol_out:.2f} SOL</b>\n"
+                f"📊 Remaining: {trade['sol_remaining']:.2f} SOL riding for 10X"
+            )
+            log.info(f"[PAPER] TP1 {symbol} @ {current_x:.1f}X — sold 80% for {sol_out:.2f} SOL")
+        
+        # ── Take Profit 2: 10X → sell remaining 20% ──
+        elif current_x >= PAPER_TP2_X and trade["tp1_hit"] and not trade["tp2_hit"]:
+            trade["tp2_hit"] = True
+            sol_out = trade["sol_remaining"] * current_x
+            trade["sol_realized"] += sol_out
+            trade["sol_remaining"] = 0
+            trade["status"] = "closed"
+            trade["closed_at"] = utcnow().isoformat()
+            pnl = trade["sol_realized"] - trade["entry_sol"]
+            messages.append(
+                f"💎 <b>PAPER TAKE PROFIT 2 (10X)</b>\n\n"
+                f"<b>{name}</b> ${symbol}\n"
+                f"Entry: ${entry_mcap:,.0f} → ${current_mcap:,.0f} ({current_x:.1f}X)\n"
+                f"💰 Sold remaining 20% → Total P&L: <b>+{pnl:.2f} SOL</b> 🔥"
+            )
+            log.info(f"[PAPER] TP2 {symbol} @ {current_x:.1f}X — FULL EXIT — P&L: +{pnl:.2f} SOL")
+    
+    return messages
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # TRENDING BURST DETECTION
 # ═══════════════════════════════════════════════════════════════════════════════
 BURST_WINDOW = 300          # 5 minutes to detect burst
@@ -729,6 +861,11 @@ async def burst_evaluator(theme: str, count: int):
         deployer = best.get("deployer", "")
         desc = best.get("desc", "")
         asyncio.create_task(lifecycle_tracker(mint, name, symbol, deployer, desc, narrative, entry_mcap, result.get("final_score", 0)))
+        
+        # Paper trade — auto buy trending winner
+        async with paper_lock:
+            paper_buy(mint, name, symbol, entry_mcap, result.get("final_score", 0), "trending")
+        asyncio.create_task(save_paper_trades())
         
     except Exception as e:
         log.error(f"[BURST] Evaluator error for '{theme}': {e}")
@@ -1377,6 +1514,10 @@ def format_help() -> str:
         "/scalpadd X   — add scalp pattern",
         "/scalprem X   — remove scalp pattern",
         "/topx N       — tokens that hit NX+",
+        "/pnl          — paper trading P&L",
+        "/pnl24        — last 24h P&L",
+        "/pnl7         — last 7 day P&L",
+        "/trades       — open paper positions",
         "/help         — this menu",
     ])
 
@@ -1423,6 +1564,17 @@ async def track_tokens():
                                 t.alerted_xs.add(x)
                                 log.info(f"[TRACKER] {x}X: {t.symbol}")
                                 await send_tg(format_x_alert(t, mcap, x))
+                
+                # Update paper trades for this token
+                try:
+                    async with paper_lock:
+                        msgs = paper_update_price(mint, mcap)
+                    for m in msgs:
+                        await send_tg(m)
+                    if msgs:
+                        asyncio.create_task(save_paper_trades())
+                except Exception:
+                    pass
             except Exception as e:
                 log.error(f"[TRACKER] {mint[:12]}: {e}")
 
@@ -1959,6 +2111,155 @@ async def handle_commands():
         else:
             await send_tg(msg, cid)
 
+    async def send_pnl(cid, days=None):
+        try:
+            async with paper_lock:
+                trades = list(paper_trades)
+            
+            if not trades:
+                await send_tg("💰 No paper trades yet. Waiting for alerts!", cid)
+                return
+            
+            # Filter by time period
+            period = "ALL TIME"
+            if days:
+                cutoff = utcnow() - timedelta(days=days)
+                filtered = []
+                for t in trades:
+                    try:
+                        opened = datetime.fromisoformat(t.get("opened_at", "2000-01-01"))
+                        if opened >= cutoff:
+                            filtered.append(t)
+                    except Exception:
+                        filtered.append(t)
+                trades = filtered
+                period = "24H" if days == 1 else f"{days}D"
+            
+            if not trades:
+                await send_tg(f"💰 No trades for {period}.", cid)
+                return
+            
+            total = len(trades)
+            open_trades = [t for t in trades if t["status"] != "closed"]
+            closed_trades = [t for t in trades if t["status"] == "closed"]
+            
+            total_invested = sum(t.get("entry_sol", 1.0) for t in trades)
+            
+            # Current value of open positions
+            open_value = 0
+            for t in open_trades:
+                open_value += t.get("sol_remaining", 0) * t.get("current_x", 1.0)
+            
+            # Realized from closed + partial (TP1 hit)
+            total_realized = sum(t.get("sol_realized", 0) for t in trades)
+            
+            # Unrealized from open
+            total_current = total_realized + open_value
+            total_pnl = total_current - total_invested
+            pnl_pct = (total_pnl / total_invested * 100) if total_invested > 0 else 0
+            
+            # Win stats
+            winners = [t for t in trades if t.get("peak_x", 1) >= 2.0]
+            tp1_hits = [t for t in trades if t.get("tp1_hit")]
+            tp2_hits = [t for t in trades if t.get("tp2_hit")]
+            sl_hits = [t for t in trades if t.get("sl_hit")]
+            win_rate = int(len(winners) * 100 / total) if total else 0
+            
+            # Best/worst
+            best_trade = max(trades, key=lambda t: t.get("peak_x", 0))
+            worst_closed = sorted(closed_trades, key=lambda t: t.get("current_x", 1))
+            
+            # By alert type
+            type_stats = {}
+            for t in trades:
+                at = t.get("alert_type", "normal")
+                if at not in type_stats:
+                    type_stats[at] = {"count": 0, "pnl": 0}
+                type_stats[at]["count"] += 1
+                realized = t.get("sol_realized", 0)
+                unrealized = t.get("sol_remaining", 0) * t.get("current_x", 1.0) if t["status"] != "closed" else 0
+                type_stats[at]["pnl"] += (realized + unrealized) - t.get("entry_sol", 1.0)
+            
+            pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
+            
+            msg = f"💰 <b>PAPER TRADING P&L — {period}</b>\n\n"
+            msg += f"<b>Portfolio:</b> {total} trades\n"
+            msg += f"Invested:  <b>{total_invested:.1f} SOL</b>\n"
+            msg += f"Current:   <b>{total_current:.1f} SOL</b>\n"
+            msg += f"{pnl_emoji} P&L:      <b>{total_pnl:+.2f} SOL ({pnl_pct:+.1f}%)</b>\n\n"
+            
+            msg += f"Open:   {len(open_trades)} positions\n"
+            msg += f"Closed: {len(closed_trades)} positions\n"
+            msg += f"Win rate (2X+): <b>{win_rate}%</b>\n\n"
+            
+            msg += f"<b>── TP/SL Stats ──</b>\n"
+            msg += f"✅ TP1 (5X): {len(tp1_hits)} hits\n"
+            msg += f"💎 TP2 (10X): {len(tp2_hits)} hits\n"
+            msg += f"🔴 Stop Loss: {len(sl_hits)} hits\n\n"
+            
+            if best_trade:
+                bp = best_trade.get("peak_x", 0)
+                bn = best_trade.get("name", "?")
+                msg += f"🏆 Best: <b>{bn}</b> — {bp:.1f}X\n"
+            if worst_closed:
+                wn = worst_closed[0].get("name", "?")
+                wx = worst_closed[0].get("current_x", 0)
+                msg += f"💀 Worst: <b>{wn}</b> — {wx:.2f}X\n"
+            
+            if type_stats:
+                msg += f"\n<b>── By Alert Type ──</b>\n"
+                for at, stats in sorted(type_stats.items(), key=lambda x: x[1]["pnl"], reverse=True):
+                    e = "🟢" if stats["pnl"] >= 0 else "🔴"
+                    msg += f"  {at}: {stats['count']} trades → {e} <b>{stats['pnl']:+.2f} SOL</b>\n"
+            
+            await send_tg(msg, cid)
+        except Exception as e:
+            log.error(f"[PNL] {e}")
+            await send_tg(f"⚠️ PnL error: {e}", cid)
+    
+    async def send_trades(cid):
+        try:
+            async with paper_lock:
+                open_trades = [t for t in paper_trades if t["status"] != "closed"]
+            
+            if not open_trades:
+                await send_tg("📋 No open paper trades.", cid)
+                return
+            
+            sorted_t = sorted(open_trades, key=lambda t: t.get("current_x", 1), reverse=True)[:15]
+            
+            msg = f"📋 <b>OPEN PAPER TRADES</b>\n"
+            msg += f"<i>{len(open_trades)} positions</i>\n\n"
+            
+            for t in sorted_t:
+                cx = t.get("current_x", 1.0)
+                px = t.get("peak_x", 1.0)
+                name = t.get("name", "?")
+                sym = t.get("symbol", "?")
+                entry = t.get("entry_mcap", 0)
+                current = t.get("current_mcap", 0)
+                status = t.get("status", "open")
+                remaining = t.get("sol_remaining", 1.0)
+                realized = t.get("sol_realized", 0)
+                
+                if cx >= 2.0:   dot = "🟢"
+                elif cx >= 1.0: dot = "🟡"
+                else:           dot = "🔴"
+                
+                tp1 = " ✅TP1" if t.get("tp1_hit") else ""
+                
+                msg += f"{dot} <b>{name}</b> ${sym}{tp1}\n"
+                msg += f"   {cx:.1f}X now | Peak: {px:.1f}X | ${entry:,.0f}→${current:,.0f}\n"
+                msg += f"   Remaining: {remaining:.2f} SOL | Realized: {realized:.2f} SOL\n\n"
+            
+            if len(msg) > 4000:
+                await send_tg(msg[:4000], cid)
+            else:
+                await send_tg(msg, cid)
+        except Exception as e:
+            log.error(f"[TRADES] {e}")
+            await send_tg(f"⚠️ Trades error: {e}", cid)
+
     commands = {
         '/status':      lambda cid: send_tg(format_status(), cid),
         '/leaderboard': lambda cid: send_lb(cid, 1),
@@ -1972,6 +2273,10 @@ async def handle_commands():
         '/analytics30': lambda cid: send_analytics(cid, 30),
         '/patterns':    lambda cid: send_patterns(cid),
         '/scalp':       lambda cid: send_scalp_list(cid),
+        '/pnl':         lambda cid: send_pnl(cid),
+        '/pnl24':       lambda cid: send_pnl(cid, 1),
+        '/pnl7':        lambda cid: send_pnl(cid, 7),
+        '/trades':      lambda cid: send_trades(cid),
         '/help':        lambda cid: send_tg(format_help(), cid),
     }
     
@@ -2307,6 +2612,14 @@ async def _process_token(msg: dict):
 
         # Lifecycle tracker — monitors at 5min, 15min, 30min, 1hr
         asyncio.create_task(lifecycle_tracker(mint, name, symbol, deployer, desc, narrative, entry_mcap, score))
+
+        # Paper trade — auto buy
+        scalp_match, scalp_pat = is_scalp_token(name, symbol)
+        is_cult = "cult" in f"{name} {symbol}".lower()
+        alert_type = "scalp" if scalp_match else "cult" if is_cult else "normal"
+        async with paper_lock:
+            paper_buy(mint, name, symbol, entry_mcap, score, alert_type)
+        asyncio.create_task(save_paper_trades())
     else:
         log.info(f"  -> Score {score} < {ALERT_THRESHOLD} — skip")
 
@@ -2556,6 +2869,7 @@ async def run():
     global bot_start_time
     bot_start_time = utcnow()
     load_leaderboard()
+    load_paper_trades()
 
     kw_count = len(_KW_PATTERNS)
     cat_counts = {}
