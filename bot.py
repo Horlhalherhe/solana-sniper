@@ -440,7 +440,8 @@ PAPER_SOL_PER_TRADE = float(os.getenv("PAPER_SOL_PER_TRADE", "1.0"))
 PAPER_TP1_X = 5.0    # Take 80% profit at 5X
 PAPER_TP1_PCT = 0.80  # Sell 80% at TP1
 PAPER_TP2_X = 10.0   # Sell remaining 20% at 10X
-PAPER_SL_X = 0.5     # Stop loss at -50%
+PAPER_SL_X = 0.3            # Stop loss at -70% (only after grace period)
+PAPER_SL_GRACE_MIN = 30     # No stop loss for first 30 minutes
 
 paper_trades: List[dict] = []
 paper_lock = asyncio.Lock()
@@ -510,22 +511,31 @@ def paper_update_price(mint: str, current_mcap: float) -> list:
         name = trade["name"]
         symbol = trade["symbol"]
         
-        # ── Stop Loss: -50% ──
+        # ── Stop Loss: -70% but only after 30min grace period ──
         if current_x <= PAPER_SL_X and not trade["sl_hit"]:
-            trade["sl_hit"] = True
-            sol_lost = trade["sol_remaining"] * current_x
-            trade["sol_realized"] += sol_lost
-            trade["sol_remaining"] = 0
-            trade["status"] = "closed"
-            trade["closed_at"] = utcnow().isoformat()
-            pnl = trade["sol_realized"] - trade["entry_sol"]
-            messages.append(
-                f"🔴 <b>PAPER STOP LOSS</b>\n\n"
-                f"<b>{name}</b> ${symbol}\n"
-                f"Entry: ${entry_mcap:,.0f} → ${current_mcap:,.0f} ({current_x:.2f}X)\n"
-                f"💰 Sold all at -50% → <b>{pnl:+.2f} SOL</b>"
-            )
-            log.info(f"[PAPER] SL {symbol} @ {current_x:.2f}X — P&L: {pnl:+.2f} SOL")
+            # Check if grace period has passed
+            try:
+                opened = datetime.fromisoformat(trade.get("opened_at", "2000-01-01"))
+                age_min = (utcnow() - opened).total_seconds() / 60
+            except Exception:
+                age_min = 999  # If can't parse, assume old enough
+            
+            if age_min >= PAPER_SL_GRACE_MIN:
+                trade["sl_hit"] = True
+                sol_lost = trade["sol_remaining"] * current_x
+                trade["sol_realized"] += sol_lost
+                trade["sol_remaining"] = 0
+                trade["status"] = "closed"
+                trade["closed_at"] = utcnow().isoformat()
+                pnl = trade["sol_realized"] - trade["entry_sol"]
+                messages.append(
+                    f"🔴 <b>PAPER STOP LOSS (-70%)</b>\n\n"
+                    f"<b>{name}</b> ${symbol}\n"
+                    f"Entry: ${entry_mcap:,.0f} → ${current_mcap:,.0f} ({current_x:.2f}X)\n"
+                    f"⏱ Age: {age_min:.0f}min (past 30min grace)\n"
+                    f"💰 Sold all → <b>{pnl:+.2f} SOL</b>"
+                )
+                log.info(f"[PAPER] SL {symbol} @ {current_x:.2f}X after {age_min:.0f}min — P&L: {pnl:+.2f} SOL")
         
         # ── Take Profit 1: 5X → sell 80% ──
         elif current_x >= PAPER_TP1_X and not trade["tp1_hit"]:
@@ -2195,7 +2205,7 @@ async def handle_commands():
             msg += f"<b>── TP/SL Stats ──</b>\n"
             msg += f"✅ TP1 (5X): {len(tp1_hits)} hits\n"
             msg += f"💎 TP2 (10X): {len(tp2_hits)} hits\n"
-            msg += f"🔴 Stop Loss: {len(sl_hits)} hits\n\n"
+            msg += f"🔴 Stop Loss (-70% after 30min): {len(sl_hits)} hits\n\n"
             
             if best_trade:
                 bp = best_trade.get("peak_x", 0)
