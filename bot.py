@@ -1539,6 +1539,7 @@ def format_help() -> str:
         "/pnl24        — last 24h P&L",
         "/pnl7         — last 7 day P&L",
         "/trades       — open paper positions",
+        "/paperreset   — clear all paper trades",
         "/help         — this menu",
     ])
 
@@ -2281,6 +2282,17 @@ async def handle_commands():
             log.error(f"[TRADES] {e}")
             await send_tg(f"⚠️ Trades error: {e}", cid)
 
+    async def reset_paper(cid):
+        try:
+            async with paper_lock:
+                old_count = len(paper_trades)
+                paper_trades.clear()
+            asyncio.create_task(save_paper_trades())
+            await send_tg(f"🗑 Paper trades cleared. {old_count} trades removed.\nFresh start — new trades will use current TP/SL rules.", cid)
+            log.info(f"[PAPER] Reset — {old_count} trades cleared")
+        except Exception as e:
+            await send_tg(f"⚠️ Reset error: {e}", cid)
+
     commands = {
         '/status':      lambda cid: send_tg(format_status(), cid),
         '/leaderboard': lambda cid: send_lb(cid, 1),
@@ -2298,6 +2310,7 @@ async def handle_commands():
         '/pnl24':       lambda cid: send_pnl(cid, 1),
         '/pnl7':        lambda cid: send_pnl(cid, 7),
         '/trades':      lambda cid: send_trades(cid),
+        '/paperreset':  lambda cid: reset_paper(cid),
         '/help':        lambda cid: send_tg(format_help(), cid),
     }
     
@@ -2941,12 +2954,3 @@ if __name__ == "__main__":
         log.info("Interrupted")
     except Exception as e:
         log.critical(f"Fatal: {e}"); raise
-
-
-
-
-
-
-
-
-
