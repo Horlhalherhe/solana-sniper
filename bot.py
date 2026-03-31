@@ -970,6 +970,17 @@ async def get_updates(offset: int = 0) -> list:
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATA FETCHERS
 # ═══════════════════════════════════════════════════════════════════════════════
+def _safe_int(val, default=1):
+    """Safely convert to int — handles dict, None, str, etc."""
+    if val is None:
+        return default
+    if isinstance(val, (dict, list)):
+        return default
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
 async def fetch_dexscreener(mint: str) -> dict:
     try:
         async with httpx.AsyncClient(timeout=8) as client:
@@ -993,11 +1004,11 @@ async def fetch_dexscreener(mint: str) -> dict:
                 "volume_1h_usd":       float((pair.get("volume") or {}).get("h1") or 0),
                 "volume_5m_usd":       float((pair.get("volume") or {}).get("m5") or 0),
                 "price_change_1h_pct": float((pair.get("priceChange") or {}).get("h1") or 0),
-                "buy_sell_ratio_1h":   int((pair.get("txns") or {}).get("h1", {}).get("buys") or 1) /
-                                       max(int((pair.get("txns") or {}).get("h1", {}).get("sells") or 1), 1),
-                "total_holders":       int(pair.get("holders", 50)),
+                "buy_sell_ratio_1h":   _safe_int((pair.get("txns") or {}).get("h1", {}).get("buys")) /
+                                       max(_safe_int((pair.get("txns") or {}).get("h1", {}).get("sells")), 1),
+                "total_holders":       _safe_int(pair.get("holders"), 50),
                 "dex_paid":            has_dex_paid,
-                "boosts":              int(boosts),
+                "boosts":              _safe_int(boosts),
             }
     except Exception as e:
         log.warning(f"[DexScreener] {mint[:12]}: {e}")
@@ -2930,3 +2941,12 @@ if __name__ == "__main__":
         log.info("Interrupted")
     except Exception as e:
         log.critical(f"Fatal: {e}"); raise
+
+
+
+
+
+
+
+
+
