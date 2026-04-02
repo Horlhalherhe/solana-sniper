@@ -437,7 +437,7 @@ def is_scalp_token(name: str, symbol: str) -> tuple:
 # ═══════════════════════════════════════════════════════════════════════════════
 PAPER_FILE = DATA_DIR / "paper_trades.json"
 PAPER_SOL_PER_TRADE = float(os.getenv("PAPER_SOL_PER_TRADE", "1.0"))
-PAPER_TP1_X = 5.0    # Take 80% profit at 5X
+PAPER_TP1_X = 2.0    # Take 80% profit at 2X
 PAPER_TP1_PCT = 0.80  # Sell 80% at TP1
 PAPER_TP2_X = 10.0   # Sell remaining 20% at 10X
 PAPER_SL_X = 0.3            # Stop loss at -70% (only after grace period)
@@ -537,7 +537,7 @@ def paper_update_price(mint: str, current_mcap: float) -> list:
                 )
                 log.info(f"[PAPER] SL {symbol} @ {current_x:.2f}X after {age_min:.0f}min — P&L: {pnl:+.2f} SOL")
         
-        # ── Take Profit 1: 5X → sell 80% ──
+        # ── Take Profit 1: 2X → sell 80% ──
         elif current_x >= PAPER_TP1_X and not trade["tp1_hit"]:
             trade["tp1_hit"] = True
             sell_amount = trade["entry_sol"] * PAPER_TP1_PCT
@@ -546,7 +546,7 @@ def paper_update_price(mint: str, current_mcap: float) -> list:
             trade["sol_remaining"] = trade["entry_sol"] * (1 - PAPER_TP1_PCT)
             trade["status"] = "tp1"
             messages.append(
-                f"🟢 <b>PAPER TAKE PROFIT 1 (5X)</b>\n\n"
+                f"🟢 <b>PAPER TAKE PROFIT 1 (2X)</b>\n\n"
                 f"<b>{name}</b> ${symbol}\n"
                 f"Entry: ${entry_mcap:,.0f} → ${current_mcap:,.0f} ({current_x:.1f}X)\n"
                 f"💰 Sold 80% → <b>+{sol_out:.2f} SOL</b>\n"
@@ -2215,7 +2215,7 @@ async def handle_commands():
             msg += f"Win rate (2X+): <b>{win_rate}%</b>\n\n"
             
             msg += f"<b>── TP/SL Stats ──</b>\n"
-            msg += f"✅ TP1 (5X): {len(tp1_hits)} hits\n"
+            msg += f"✅ TP1 (2X): {len(tp1_hits)} hits\n"
             msg += f"💎 TP2 (10X): {len(tp2_hits)} hits\n"
             msg += f"🔴 Stop Loss (-70% after 30min): {len(sl_hits)} hits\n\n"
             
