@@ -32,7 +32,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 HELIUS_API_KEY     = os.getenv("HELIUS_API_KEY", "")
 BIRDEYE_API_KEY    = os.getenv("BIRDEYE_API_KEY", "")
-ALERT_THRESHOLD    = float(os.getenv("ALERT_THRESHOLD", "5.0"))
+ALERT_THRESHOLD    = float(os.getenv("ALERT_THRESHOLD", "7.5"))
 MIN_MCAP           = float(os.getenv("MIN_MCAP", "5000"))
 MAX_MCAP           = float(os.getenv("MAX_ENTRY_MCAP", "100000"))
 MAX_DEV_HOLDS_PCT  = float(os.getenv("MAX_DEV_HOLDS_PCT", "8.0"))
@@ -580,7 +580,7 @@ def paper_update_price(mint: str, current_mcap: float) -> list:
 BURST_WINDOW = 300          # 5 minutes to detect burst
 BURST_MIN_TOKENS = 3        # Need 3+ similar tokens to detect a burst
 BURST_ALERTED: Dict[str, float] = {}  # theme -> timestamp of last alert (avoid spam)
-BURST_EVAL_DELAY = 600      # 10 minutes — wait for candidates before picking winner
+BURST_EVAL_DELAY = 300      # 5 minutes — pick winner before pump peaks
 
 # Burst candidates: theme -> list of {mint, name, symbol, token, score, narrative, ...}
 _burst_candidates: Dict[str, list] = {}
@@ -684,9 +684,9 @@ async def burst_evaluator(theme: str, count: int):
                 buy_ratio = dex.get("buy_sell_ratio_1h", 1.0)
                 price_change = dex.get("price_change_1h_pct", 0)
                 
-                # Skip dead tokens
-                if current_mcap < 3000 and current_liq < 1000:
-                    log.info(f"  [BURST] {cand['symbol']} — dead (mcap=${current_mcap:,.0f})")
+                # Skip tokens below minimum mcap
+                if current_mcap < MIN_MCAP and current_liq < 5000:
+                    log.info(f"  [BURST] {cand['symbol']} — below ${MIN_MCAP:,.0f} (mcap=${current_mcap:,.0f})")
                     continue
                 
                 # Score candidates — organic growth matters most when multiple have dex_paid
@@ -755,6 +755,13 @@ async def burst_evaluator(theme: str, count: int):
         
         if not best:
             log.info(f"[BURST] '{theme}' — no viable candidates after evaluation")
+            return
+        
+        # Final mcap check — winner must be above minimum
+        winner_mcap = best.get("current_mcap", 0)
+        winner_liq = best.get("current_liq", 0)
+        if winner_mcap < MIN_MCAP and winner_liq < 5000:
+            log.info(f"[BURST] '{theme}' — winner below ${MIN_MCAP:,.0f} (mcap=${winner_mcap:,.0f}), skipping")
             return
         
         # Build and send trending alert for the winner
