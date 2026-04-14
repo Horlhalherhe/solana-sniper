@@ -437,9 +437,9 @@ def is_scalp_token(name: str, symbol: str) -> tuple:
 # ═══════════════════════════════════════════════════════════════════════════════
 PAPER_FILE = DATA_DIR / "paper_trades.json"
 PAPER_SOL_PER_TRADE = float(os.getenv("PAPER_SOL_PER_TRADE", "1.0"))
-PAPER_TP1_X = 2.0    # Take 80% profit at 2X
-PAPER_TP1_PCT = 0.80  # Sell 80% at TP1
-PAPER_TP2_X = 10.0   # Sell remaining 20% at 10X
+PAPER_TP1_X = 2.0    # Take 95% profit at 2X
+PAPER_TP1_PCT = 0.95  # Sell 95% at TP1
+PAPER_TP2_X = 10.0   # Sell remaining 5% at 10X
 PAPER_SL_X = 0.3            # Stop loss at -70% (only after grace period)
 PAPER_SL_GRACE_MIN = 30     # No stop loss for first 30 minutes
 
@@ -549,12 +549,12 @@ def paper_update_price(mint: str, current_mcap: float) -> list:
                 f"🟢 <b>PAPER TAKE PROFIT 1 (2X)</b>\n\n"
                 f"<b>{name}</b> ${symbol}\n"
                 f"Entry: ${entry_mcap:,.0f} → ${current_mcap:,.0f} ({current_x:.1f}X)\n"
-                f"💰 Sold 80% → <b>+{sol_out:.2f} SOL</b>\n"
+                f"💰 Sold 95% → <b>+{sol_out:.2f} SOL</b>\n"
                 f"📊 Remaining: {trade['sol_remaining']:.2f} SOL riding for 10X"
             )
-            log.info(f"[PAPER] TP1 {symbol} @ {current_x:.1f}X — sold 80% for {sol_out:.2f} SOL")
+            log.info(f"[PAPER] TP1 {symbol} @ {current_x:.1f}X — sold 95% for {sol_out:.2f} SOL")
         
-        # ── Take Profit 2: 10X → sell remaining 20% ──
+        # ── Take Profit 2: 10X → sell remaining 5% ──
         elif current_x >= PAPER_TP2_X and trade["tp1_hit"] and not trade["tp2_hit"]:
             trade["tp2_hit"] = True
             sol_out = trade["sol_remaining"] * current_x
@@ -567,7 +567,7 @@ def paper_update_price(mint: str, current_mcap: float) -> list:
                 f"💎 <b>PAPER TAKE PROFIT 2 (10X)</b>\n\n"
                 f"<b>{name}</b> ${symbol}\n"
                 f"Entry: ${entry_mcap:,.0f} → ${current_mcap:,.0f} ({current_x:.1f}X)\n"
-                f"💰 Sold remaining 20% → Total P&L: <b>+{pnl:.2f} SOL</b> 🔥"
+                f"💰 Sold remaining 5% → Total P&L: <b>+{pnl:.2f} SOL</b> 🔥"
             )
             log.info(f"[PAPER] TP2 {symbol} @ {current_x:.1f}X — FULL EXIT — P&L: +{pnl:.2f} SOL")
     
@@ -580,7 +580,7 @@ def paper_update_price(mint: str, current_mcap: float) -> list:
 BURST_WINDOW = 300          # 5 minutes to detect burst
 BURST_MIN_TOKENS = 3        # Need 3+ similar tokens to detect a burst
 BURST_ALERTED: Dict[str, float] = {}  # theme -> timestamp of last alert (avoid spam)
-BURST_EVAL_DELAY = 300      # 5 minutes — pick winner before pump peaks
+BURST_EVAL_DELAY = 600      # 10 minutes — pick winner before pump peaks
 
 # Burst candidates: theme -> list of {mint, name, symbol, token, score, narrative, ...}
 _burst_candidates: Dict[str, list] = {}
