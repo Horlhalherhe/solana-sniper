@@ -283,17 +283,19 @@ def score_token(token: dict, narrative: dict) -> dict:
         warnings.append(f"Low volume: ${vol_1h:,.0f}/1h")
     
     # ── Timing (20%) ─────────────────────────────────────────────────────────
-    age_h = token.get("age_hours", 0.5)
-    if age_h < 0.1:         tim = 6.0
-    elif age_h < 0.5:       tim = 8.5
-    elif age_h < 2:         tim = 7.5
-    elif age_h < 6:         tim = 5.0
+    # Sweet spot is now 1-2hr since we wait 1hr before alerting
+    age_h = token.get("age_hours", 1.0)
+    if age_h < 0.5:         tim = 5.0   # Too early — shouldn't happen with 1hr wait
+    elif age_h < 1.0:       tim = 6.5
+    elif age_h < 2:         tim = 8.5   # Sweet spot — survived 1hr, still early
+    elif age_h < 4:         tim = 7.5
+    elif age_h < 8:         tim = 5.0
     elif age_h < 24:        tim = 3.0
     else:                   tim = 2.0
-    
+
     scores["timing"] = tim
-    
-    if 0.1 <= age_h <= 2:
+
+    if 1.0 <= age_h <= 4:
         signals.append(f"Sweet spot timing ({age_h:.1f}h)")
     if age_h > 12:
         warnings.append(f"Late entry: {age_h:.0f}h old")
@@ -437,9 +439,9 @@ def is_scalp_token(name: str, symbol: str) -> tuple:
 # ═══════════════════════════════════════════════════════════════════════════════
 PAPER_FILE = DATA_DIR / "paper_trades.json"
 PAPER_SOL_PER_TRADE = float(os.getenv("PAPER_SOL_PER_TRADE", "1.0"))
-PAPER_TP1_X = 2.0    # Take 95% profit at 2X
-PAPER_TP1_PCT = 0.95  # Sell 95% at TP1
-PAPER_TP2_X = 10.0   # Sell remaining 5% at 10X
+PAPER_TP1_X = 2.0    # Take 80% profit at 2X
+PAPER_TP1_PCT = 0.80  # Sell 80% at TP1
+PAPER_TP2_X = 10.0   # Sell remaining 20% at 10X
 PAPER_SL_X = 0.3            # Stop loss at -70% (only after grace period)
 PAPER_SL_GRACE_MIN = 30     # No stop loss for first 30 minutes
 
@@ -549,12 +551,12 @@ def paper_update_price(mint: str, current_mcap: float) -> list:
                 f"🟢 <b>PAPER TAKE PROFIT 1 (2X)</b>\n\n"
                 f"<b>{name}</b> ${symbol}\n"
                 f"Entry: ${entry_mcap:,.0f} → ${current_mcap:,.0f} ({current_x:.1f}X)\n"
-                f"💰 Sold 95% → <b>+{sol_out:.2f} SOL</b>\n"
+                f"💰 Sold 80% → <b>+{sol_out:.2f} SOL</b>\n"
                 f"📊 Remaining: {trade['sol_remaining']:.2f} SOL riding for 10X"
             )
-            log.info(f"[PAPER] TP1 {symbol} @ {current_x:.1f}X — sold 95% for {sol_out:.2f} SOL")
+            log.info(f"[PAPER] TP1 {symbol} @ {current_x:.1f}X — sold 80% for {sol_out:.2f} SOL")
         
-        # ── Take Profit 2: 10X → sell remaining 5% ──
+        # ── Take Profit 2: 10X → sell remaining 20% ──
         elif current_x >= PAPER_TP2_X and trade["tp1_hit"] and not trade["tp2_hit"]:
             trade["tp2_hit"] = True
             sol_out = trade["sol_remaining"] * current_x
@@ -567,7 +569,7 @@ def paper_update_price(mint: str, current_mcap: float) -> list:
                 f"💎 <b>PAPER TAKE PROFIT 2 (10X)</b>\n\n"
                 f"<b>{name}</b> ${symbol}\n"
                 f"Entry: ${entry_mcap:,.0f} → ${current_mcap:,.0f} ({current_x:.1f}X)\n"
-                f"💰 Sold remaining 5% → Total P&L: <b>+{pnl:.2f} SOL</b> 🔥"
+                f"💰 Sold remaining 20% → Total P&L: <b>+{pnl:.2f} SOL</b> 🔥"
             )
             log.info(f"[PAPER] TP2 {symbol} @ {current_x:.1f}X — FULL EXIT — P&L: +{pnl:.2f} SOL")
     
@@ -580,7 +582,7 @@ def paper_update_price(mint: str, current_mcap: float) -> list:
 BURST_WINDOW = 300          # 5 minutes to detect burst
 BURST_MIN_TOKENS = 3        # Need 3+ similar tokens to detect a burst
 BURST_ALERTED: Dict[str, float] = {}  # theme -> timestamp of last alert (avoid spam)
-BURST_EVAL_DELAY = 600      # 10 minutes — pick winner before pump peaks
+BURST_EVAL_DELAY = 300      # 5 minutes — pick winner before pump peaks
 
 # Burst candidates: theme -> list of {mint, name, symbol, token, score, narrative, ...}
 _burst_candidates: Dict[str, list] = {}
@@ -2472,18 +2474,22 @@ async def _process_token(msg: dict):
             log.info(f"  -> Blacklisted '{bl}' — skip")
             return
 
-    # ── Wait for data ────────────────────────────────────────────────────────
-    await asyncio.sleep(WAIT_SECONDS)
-    
-    # ── Quick DexScreener check first (free, no API key) ─────────────────────
-    # Low bar: just checking "is anyone buying this?" — quality gate comes later
-    TRACTION_MCAP = max(MIN_MCAP, 3000)  # Match quality gate — no point enriching tokens that'll fail
+    # ── 1 Hour Survival Filter ───────────────────────────────────────────────
+    # Wait 1 hour — tokens that hold $7k+ mcap after 1hr have proven staying power.
+    # Eliminates rugs and dumps that die within the first hour.
+    SURVIVAL_WAIT = 3600   # 1 hour
+    SURVIVAL_MCAP = 7000   # Must still be alive at $7k+ mcap after 1hr
+
+    log.info(f"  -> Waiting 1hr survival check...")
+    await asyncio.sleep(SURVIVAL_WAIT)
+
+    # Check if token is still alive after 1 hour
     dex = await fetch_dexscreener(mint)
     dex_mcap = dex.get("mcap_usd", 0)
     dex_liq = dex.get("liquidity_usd", 0)
-    
-    if dex_mcap < TRACTION_MCAP and dex_liq < 2000:
-        # No traction — try Birdeye as backup
+
+    if dex_mcap < SURVIVAL_MCAP and dex_liq < SURVIVAL_MCAP:
+        # Try Birdeye as backup
         if BIRDEYE_API_KEY:
             try:
                 async with httpx.AsyncClient(timeout=8) as client:
@@ -2493,24 +2499,26 @@ async def _process_token(msg: dict):
                         headers={"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana"})
                     if resp.status_code == 200:
                         d = resp.json().get("data") or {}
-                        be_liq = float(d.get("liquidity") or 0)
                         be_mc = float(d.get("mc") or 0)
-                        if be_mc >= TRACTION_MCAP or be_liq >= 2000:
-                            pass  # Has traction on Birdeye, continue
+                        be_liq = float(d.get("liquidity") or 0)
+                        if be_mc >= SURVIVAL_MCAP or be_liq >= SURVIVAL_MCAP:
+                            log.info(f"  -> ✅ Survived 1hr — mcap=${be_mc:,.0f} (Birdeye)")
                         else:
-                            log.info(f"  -> No traction (mcap=${be_mc:,.0f} liq=${be_liq:,.0f}) — skip")
+                            log.info(f"  -> ❌ Dead after 1hr (mcap=${be_mc:,.0f} liq=${be_liq:,.0f}) — skip")
                             return
                     else:
-                        log.info(f"  -> No traction (DexScreener mcap=${dex_mcap:,.0f}) — skip")
+                        log.info(f"  -> ❌ Dead after 1hr (DexScreener mcap=${dex_mcap:,.0f}) — skip")
                         return
             except Exception:
-                log.info(f"  -> No traction (DexScreener mcap=${dex_mcap:,.0f}) — skip")
+                log.info(f"  -> ❌ Dead after 1hr (DexScreener mcap=${dex_mcap:,.0f}) — skip")
                 return
         else:
-            log.info(f"  -> No traction (mcap=${dex_mcap:,.0f} liq=${dex_liq:,.0f}) — skip")
+            log.info(f"  -> ❌ Dead after 1hr (mcap=${dex_mcap:,.0f} liq=${dex_liq:,.0f}) — skip")
             return
+    else:
+        log.info(f"  -> ✅ Survived 1hr — mcap=${dex_mcap:,.0f} liq=${dex_liq:,.0f}")
 
-    log.info(f"  -> Token has traction — enriching with full data")
+    log.info(f"  -> Enriching with full data")
 
     # ── Full enrichment (Helius + Birdeye/DexScreener) ────────────────────────
     token, source = await enrich_token(mint, name, symbol, deployer)
@@ -2920,7 +2928,7 @@ async def run():
     log.info("=" * 50)
     log.info("  TekkiSniPer — BOT ONLINE [v4.0 CLEAN]")
     log.info(f"  Threshold: {ALERT_THRESHOLD}  MinMCap: ${MIN_MCAP:,.0f}  MaxMCap: ${MAX_MCAP:,.0f}")
-    log.info(f"  MaxDevHolds: {MAX_DEV_HOLDS_PCT}%  Wait: {WAIT_SECONDS}s")
+    log.info(f"  MaxDevHolds: {MAX_DEV_HOLDS_PCT}%  Survival wait: 1hr @ $7k+")
     log.info(f"  Keywords: {kw_count} across {len(cat_counts)} categories")
     for cat, count in sorted(cat_counts.items()):
         log.info(f"    {cat}: {count} keywords")
