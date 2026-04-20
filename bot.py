@@ -283,19 +283,17 @@ def score_token(token: dict, narrative: dict) -> dict:
         warnings.append(f"Low volume: ${vol_1h:,.0f}/1h")
     
     # ── Timing (20%) ─────────────────────────────────────────────────────────
-    # Sweet spot is now 1-2hr since we wait 1hr before alerting
-    age_h = token.get("age_hours", 1.0)
-    if age_h < 0.5:         tim = 5.0   # Too early — shouldn't happen with 1hr wait
-    elif age_h < 1.0:       tim = 6.5
-    elif age_h < 2:         tim = 8.5   # Sweet spot — survived 1hr, still early
-    elif age_h < 4:         tim = 7.5
-    elif age_h < 8:         tim = 5.0
+    age_h = token.get("age_hours", 0.5)
+    if age_h < 0.1:         tim = 6.0
+    elif age_h < 0.5:       tim = 8.5
+    elif age_h < 2:         tim = 7.5
+    elif age_h < 6:         tim = 5.0
     elif age_h < 24:        tim = 3.0
     else:                   tim = 2.0
-
+    
     scores["timing"] = tim
-
-    if 1.0 <= age_h <= 4:
+    
+    if 0.1 <= age_h <= 2:
         signals.append(f"Sweet spot timing ({age_h:.1f}h)")
     if age_h > 12:
         warnings.append(f"Late entry: {age_h:.0f}h old")
@@ -2474,22 +2472,16 @@ async def _process_token(msg: dict):
             log.info(f"  -> Blacklisted '{bl}' — skip")
             return
 
-    # ── 1 Hour Survival Filter ───────────────────────────────────────────────
-    # Wait 1 hour — tokens that hold $7k+ mcap after 1hr have proven staying power.
-    # Eliminates rugs and dumps that die within the first hour.
-    SURVIVAL_WAIT = 3600   # 1 hour
-    SURVIVAL_MCAP = 7000   # Must still be alive at $7k+ mcap after 1hr
+    # ── Quick wait for initial data (60s) ────────────────────────────────────
+    await asyncio.sleep(WAIT_SECONDS)
 
-    log.info(f"  -> Waiting 1hr survival check...")
-    await asyncio.sleep(SURVIVAL_WAIT)
-
-    # Check if token is still alive after 1 hour
+    # ── Quick traction check — is anyone even buying this? ───────────────────
+    TRACTION_MCAP = max(MIN_MCAP, 3000)
     dex = await fetch_dexscreener(mint)
     dex_mcap = dex.get("mcap_usd", 0)
     dex_liq = dex.get("liquidity_usd", 0)
 
-    if dex_mcap < SURVIVAL_MCAP and dex_liq < SURVIVAL_MCAP:
-        # Try Birdeye as backup
+    if dex_mcap < TRACTION_MCAP and dex_liq < 2000:
         if BIRDEYE_API_KEY:
             try:
                 async with httpx.AsyncClient(timeout=8) as client:
@@ -2499,26 +2491,22 @@ async def _process_token(msg: dict):
                         headers={"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana"})
                     if resp.status_code == 200:
                         d = resp.json().get("data") or {}
-                        be_mc = float(d.get("mc") or 0)
                         be_liq = float(d.get("liquidity") or 0)
-                        if be_mc >= SURVIVAL_MCAP or be_liq >= SURVIVAL_MCAP:
-                            log.info(f"  -> ✅ Survived 1hr — mcap=${be_mc:,.0f} (Birdeye)")
-                        else:
-                            log.info(f"  -> ❌ Dead after 1hr (mcap=${be_mc:,.0f} liq=${be_liq:,.0f}) — skip")
+                        be_mc = float(d.get("mc") or 0)
+                        if be_mc < TRACTION_MCAP and be_liq < 2000:
+                            log.info(f"  -> No traction (mcap=${be_mc:,.0f} liq=${be_liq:,.0f}) — skip")
                             return
                     else:
-                        log.info(f"  -> ❌ Dead after 1hr (DexScreener mcap=${dex_mcap:,.0f}) — skip")
+                        log.info(f"  -> No traction (DexScreener mcap=${dex_mcap:,.0f}) — skip")
                         return
             except Exception:
-                log.info(f"  -> ❌ Dead after 1hr (DexScreener mcap=${dex_mcap:,.0f}) — skip")
+                log.info(f"  -> No traction (DexScreener mcap=${dex_mcap:,.0f}) — skip")
                 return
         else:
-            log.info(f"  -> ❌ Dead after 1hr (mcap=${dex_mcap:,.0f} liq=${dex_liq:,.0f}) — skip")
+            log.info(f"  -> No traction (mcap=${dex_mcap:,.0f} liq=${dex_liq:,.0f}) — skip")
             return
-    else:
-        log.info(f"  -> ✅ Survived 1hr — mcap=${dex_mcap:,.0f} liq=${dex_liq:,.0f}")
 
-    log.info(f"  -> Enriching with full data")
+    log.info(f"  -> Token has traction — enriching with full data")
 
     # ── Full enrichment (Helius + Birdeye/DexScreener) ────────────────────────
     token, source = await enrich_token(mint, name, symbol, deployer)
@@ -2589,6 +2577,41 @@ async def _process_token(msg: dict):
     result = score_token(token, narrative)
     score = result["final_score"]
     log.info(f"  -> Score: {score}/10  {result['verdict']}")
+
+    # ── Survival Check — wait 1 hour, confirm mcap still $7k+ ───────────────
+    # Token passed all filters and scored well. Now wait to confirm it has
+    # staying power before firing the alert.
+    log.info(f"  -> ⏳ Passed filters (score={score}) — waiting {SURVIVAL_WAIT_SEC//60}min survival check...")
+    await asyncio.sleep(SURVIVAL_WAIT_SEC)
+
+    # Re-check mcap after wait
+    survival_dex = await fetch_dexscreener(mint)
+    survival_mcap = survival_dex.get("mcap_usd", 0)
+    survival_liq = survival_dex.get("liquidity_usd", 0)
+
+    if survival_mcap < SURVIVAL_MIN_MCAP and BIRDEYE_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.get(
+                    "https://public-api.birdeye.so/defi/token_overview",
+                    params={"address": mint},
+                    headers={"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana"})
+                if resp.status_code == 200:
+                    d = resp.json().get("data") or {}
+                    survival_mcap = max(survival_mcap, float(d.get("mc") or 0))
+                    survival_liq = max(survival_liq, float(d.get("liquidity") or 0))
+        except Exception:
+            pass
+
+    if survival_mcap < SURVIVAL_MIN_MCAP and survival_liq < SURVIVAL_MIN_MCAP:
+        log.info(f"  -> ❌ Failed survival check — mcap=${survival_mcap:,.0f} after {SURVIVAL_WAIT_SEC//60}min — skip")
+        return
+
+    log.info(f"  -> ✅ Survived {SURVIVAL_WAIT_SEC//60}min with mcap=${survival_mcap:,.0f} — firing alert")
+
+    # Update token data with fresh post-survival numbers
+    token["mcap_usd"] = survival_mcap if survival_mcap > 0 else token["mcap_usd"]
+    token["liquidity_usd"] = survival_liq if survival_liq > 0 else token["liquidity_usd"]
 
     # ── Alert ────────────────────────────────────────────────────────────────
     if score >= ALERT_THRESHOLD:
@@ -2928,7 +2951,7 @@ async def run():
     log.info("=" * 50)
     log.info("  TekkiSniPer — BOT ONLINE [v4.0 CLEAN]")
     log.info(f"  Threshold: {ALERT_THRESHOLD}  MinMCap: ${MIN_MCAP:,.0f}  MaxMCap: ${MAX_MCAP:,.0f}")
-    log.info(f"  MaxDevHolds: {MAX_DEV_HOLDS_PCT}%  Survival wait: 1hr @ $7k+")
+    log.info(f"  MaxDevHolds: {MAX_DEV_HOLDS_PCT}%  Wait: {WAIT_SECONDS}s")
     log.info(f"  Keywords: {kw_count} across {len(cat_counts)} categories")
     for cat, count in sorted(cat_counts.items()):
         log.info(f"    {cat}: {count} keywords")
