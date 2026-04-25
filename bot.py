@@ -2472,16 +2472,18 @@ async def _process_token(msg: dict):
             log.info(f"  -> Blacklisted '{bl}' — skip")
             return
 
-    # ── Quick wait for initial data (60s) ────────────────────────────────────
+    # ── Wait for data ────────────────────────────────────────────────────────
     await asyncio.sleep(WAIT_SECONDS)
-
-    # ── Quick traction check — is anyone even buying this? ───────────────────
-    TRACTION_MCAP = max(MIN_MCAP, 3000)
+    
+    # ── Quick DexScreener check first (free, no API key) ─────────────────────
+    # Low bar: just checking "is anyone buying this?" — quality gate comes later
+    TRACTION_MCAP = max(MIN_MCAP, 3000)  # Match quality gate — no point enriching tokens that'll fail
     dex = await fetch_dexscreener(mint)
     dex_mcap = dex.get("mcap_usd", 0)
     dex_liq = dex.get("liquidity_usd", 0)
-
+    
     if dex_mcap < TRACTION_MCAP and dex_liq < 2000:
+        # No traction — try Birdeye as backup
         if BIRDEYE_API_KEY:
             try:
                 async with httpx.AsyncClient(timeout=8) as client:
@@ -2493,7 +2495,9 @@ async def _process_token(msg: dict):
                         d = resp.json().get("data") or {}
                         be_liq = float(d.get("liquidity") or 0)
                         be_mc = float(d.get("mc") or 0)
-                        if be_mc < TRACTION_MCAP and be_liq < 2000:
+                        if be_mc >= TRACTION_MCAP or be_liq >= 2000:
+                            pass  # Has traction on Birdeye, continue
+                        else:
                             log.info(f"  -> No traction (mcap=${be_mc:,.0f} liq=${be_liq:,.0f}) — skip")
                             return
                     else:
@@ -2577,41 +2581,6 @@ async def _process_token(msg: dict):
     result = score_token(token, narrative)
     score = result["final_score"]
     log.info(f"  -> Score: {score}/10  {result['verdict']}")
-
-    # ── Survival Check — wait 1 hour, confirm mcap still $7k+ ───────────────
-    # Token passed all filters and scored well. Now wait to confirm it has
-    # staying power before firing the alert.
-    log.info(f"  -> ⏳ Passed filters (score={score}) — waiting {SURVIVAL_WAIT_SEC//60}min survival check...")
-    await asyncio.sleep(SURVIVAL_WAIT_SEC)
-
-    # Re-check mcap after wait
-    survival_dex = await fetch_dexscreener(mint)
-    survival_mcap = survival_dex.get("mcap_usd", 0)
-    survival_liq = survival_dex.get("liquidity_usd", 0)
-
-    if survival_mcap < SURVIVAL_MIN_MCAP and BIRDEYE_API_KEY:
-        try:
-            async with httpx.AsyncClient(timeout=8) as client:
-                resp = await client.get(
-                    "https://public-api.birdeye.so/defi/token_overview",
-                    params={"address": mint},
-                    headers={"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana"})
-                if resp.status_code == 200:
-                    d = resp.json().get("data") or {}
-                    survival_mcap = max(survival_mcap, float(d.get("mc") or 0))
-                    survival_liq = max(survival_liq, float(d.get("liquidity") or 0))
-        except Exception:
-            pass
-
-    if survival_mcap < SURVIVAL_MIN_MCAP and survival_liq < SURVIVAL_MIN_MCAP:
-        log.info(f"  -> ❌ Failed survival check — mcap=${survival_mcap:,.0f} after {SURVIVAL_WAIT_SEC//60}min — skip")
-        return
-
-    log.info(f"  -> ✅ Survived {SURVIVAL_WAIT_SEC//60}min with mcap=${survival_mcap:,.0f} — firing alert")
-
-    # Update token data with fresh post-survival numbers
-    token["mcap_usd"] = survival_mcap if survival_mcap > 0 else token["mcap_usd"]
-    token["liquidity_usd"] = survival_liq if survival_liq > 0 else token["liquidity_usd"]
 
     # ── Alert ────────────────────────────────────────────────────────────────
     if score >= ALERT_THRESHOLD:
@@ -2992,3 +2961,5 @@ if __name__ == "__main__":
         log.info("Interrupted")
     except Exception as e:
         log.critical(f"Fatal: {e}"); raise
+                        
+        
