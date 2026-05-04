@@ -36,14 +36,21 @@ ALERT_THRESHOLD    = float(os.getenv("ALERT_THRESHOLD", "7.5"))
 MIN_MCAP           = float(os.getenv("MIN_MCAP", "5000"))
 MAX_MCAP           = float(os.getenv("MAX_ENTRY_MCAP", "100000"))
 MAX_DEV_HOLDS_PCT  = float(os.getenv("MAX_DEV_HOLDS_PCT", "8.0"))
-WAIT_SECONDS       = int(os.getenv("WAIT_SECONDS", "60"))
+WAIT_SECONDS       = int(os.getenv("WAIT_SECONDS", "60"))  # Legacy
 
 BLACKLIST_STR = os.getenv("BLACKLIST_KEYWORDS", "inu,wif,wif hat,with hat")
 BLACKLIST     = [k.strip().lower() for k in BLACKLIST_STR.split(",") if k.strip()]
 
 CHAT_IDS       = [c.strip() for c in TELEGRAM_CHAT_ID.split(",") if c.strip()] if TELEGRAM_CHAT_ID else []
-PUMP_WS_URL    = "wss://pumpportal.fun/api/data"
 X_MILESTONES   = [2, 5, 10, 25, 50, 100]
+
+# ── Momentum Scanner config ──────────────────────────────────────────────────
+SCAN_INTERVAL_SEC  = int(os.getenv("SCAN_INTERVAL_SEC", "600"))     # Scan every 10 minutes
+SCAN_MIN_MCAP      = float(os.getenv("SCAN_MIN_MCAP", "5000"))      # Min mcap $5k
+SCAN_MAX_MCAP      = float(os.getenv("SCAN_MAX_MCAP", "100000"))    # Max mcap $100k
+SCAN_MAX_AGE_DAYS  = float(os.getenv("SCAN_MAX_AGE_DAYS", "730"))   # Up to 2 years old
+SCAN_MIN_VOL_SPIKE = float(os.getenv("SCAN_MIN_VOL_SPIKE", "2.0"))  # 1h vol must be 2x+ the 6h avg/hr
+alerted_mints: set = set()  # Never double-alert same token
 
 DATA_DIR = Path(os.getenv("SNIPER_DATA_DIR", "./data"))
 DATA_DIR.mkdir(exist_ok=True)
@@ -2873,34 +2880,374 @@ async def lifecycle_tracker(mint, name, symbol, deployer, desc, narrative, entry
 # ═══════════════════════════════════════════════════════════════════════════════
 # WEBSOCKET LOOP
 # ═══════════════════════════════════════════════════════════════════════════════
-async def ws_loop():
-    delay = 5
+async def fetch_momentum_candidates() -> list:
+    """Pull gaining Solana tokens from DexScreener and Birdeye, return enriched list."""
+    candidates = {}  # mint -> data dict (dedup by mint)
+
+    # ── DexScreener: top gainers on Solana ──────────────────────────────────
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            # Gainers endpoint
+            resp = await client.get(
+                "https://api.dexscreener.com/token-boosts/top/v1",
+                headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code == 200:
+                items = resp.json() if isinstance(resp.json(), list) else []
+                for item in items[:50]:
+                    if item.get("chainId") != "solana":
+                        continue
+                    mint = item.get("tokenAddress", "")
+                    if mint and mint not in candidates:
+                        candidates[mint] = {"mint": mint, "source": "dex_boost"}
+
+            # Latest on Solana with volume
+            resp2 = await client.get(
+                "https://api.dexscreener.com/latest/dex/tokens/solana",
+                headers={"User-Agent": "Mozilla/5.0"})
+            if resp2.status_code == 200:
+                pairs = resp2.json().get("pairs") or []
+                for pair in pairs[:100]:
+                    if pair.get("chainId") != "solana":
+                        continue
+                    mint = (pair.get("baseToken") or {}).get("address", "")
+                    vol_h1 = float((pair.get("volume") or {}).get("h1") or 0)
+                    vol_h6 = float((pair.get("volume") or {}).get("h6") or 0)
+                    mcap = float(pair.get("marketCap") or pair.get("fdv") or 0)
+                    if mint and vol_h1 > 500 and SCAN_MIN_MCAP <= mcap <= SCAN_MAX_MCAP:
+                        if mint not in candidates:
+                            candidates[mint] = {"mint": mint, "source": "dex_latest"}
+    except Exception as e:
+        log.warning(f"[SCANNER] DexScreener fetch error: {e}")
+
+    # ── Birdeye: trending tokens by volume change ────────────────────────────
+    if BIRDEYE_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    "https://public-api.birdeye.so/defi/token_list",
+                    params={
+                        "sort_by": "v1hChangePercent",
+                        "sort_type": "desc",
+                        "offset": 0,
+                        "limit": 50,
+                        "min_liquidity": 1000,
+                    },
+                    headers={"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana"})
+                if resp.status_code == 200:
+                    tokens = (resp.json().get("data") or {}).get("tokens") or []
+                    for t in tokens:
+                        mint = t.get("address", "")
+                        mc = float(t.get("mc") or 0)
+                        if mint and SCAN_MIN_MCAP <= mc <= SCAN_MAX_MCAP:
+                            if mint not in candidates:
+                                candidates[mint] = {"mint": mint, "source": "birdeye_trending"}
+                            # Attach Birdeye data we already have
+                            candidates[mint].update({
+                                "mcap_usd": mc,
+                                "liquidity_usd": float(t.get("liquidity") or 0),
+                                "volume_1h_usd": float(t.get("v1hUSD") or 0),
+                                "volume_6h_usd": float(t.get("v6hUSD") or 0),
+                                "price_change_1h_pct": float(t.get("v1hChangePercent") or 0),
+                                "buy_sell_ratio_1h": int(t.get("buy1h") or 1) / max(int(t.get("sell1h") or 1), 1),
+                                "total_holders": int(t.get("holder") or 0),
+                                "name": t.get("name", ""),
+                                "symbol": t.get("symbol", ""),
+                            })
+        except Exception as e:
+            log.warning(f"[SCANNER] Birdeye fetch error: {e}")
+
+    return list(candidates.values())
+
+
+def score_momentum(data: dict) -> dict:
+    """Score a token purely on momentum signals — designed for established tokens breaking out."""
+    scores = {}
+    signals = []
+    warnings = []
+
+    # ── Volume Spike (35%) ───────────────────────────────────────────────────
+    vol_1h = data.get("volume_1h_usd", 0)
+    vol_6h = data.get("volume_6h_usd", 0)
+    avg_hourly_6h = vol_6h / 6 if vol_6h > 0 else 0
+    vol_spike = (vol_1h / avg_hourly_6h) if avg_hourly_6h > 0 else 1.0
+
+    if vol_spike >= 10:     vscore = 10.0
+    elif vol_spike >= 5:    vscore = 8.5
+    elif vol_spike >= 3:    vscore = 7.0
+    elif vol_spike >= 2:    vscore = 5.5
+    elif vol_spike >= 1.5:  vscore = 4.0
+    else:                   vscore = 2.0
+
+    if vol_1h < 500:        vscore = max(vscore - 2.0, 1.0)
+
+    scores["vol_spike"] = vscore
+    if vol_spike >= 2:
+        signals.append(f"Vol spike: {vol_spike:.1f}x (${vol_1h:,.0f}/1h)")
+    if vol_1h < 1000:
+        warnings.append(f"Low volume: ${vol_1h:,.0f}/1h")
+
+    # ── Buy Pressure (25%) ──────────────────────────────────────────────────
+    buy_ratio = data.get("buy_sell_ratio_1h", 1.0)
+    if buy_ratio >= 4.0:    bscore = 10.0
+    elif buy_ratio >= 3.0:  bscore = 8.5
+    elif buy_ratio >= 2.0:  bscore = 7.0
+    elif buy_ratio >= 1.5:  bscore = 5.5
+    elif buy_ratio >= 1.0:  bscore = 4.0
+    elif buy_ratio < 0.5:   bscore = 1.0
+    else:                   bscore = 2.5
+
+    scores["buy_pressure"] = bscore
+    if buy_ratio >= 2.0:
+        signals.append(f"Buy pressure: {buy_ratio:.1f}x")
+    if buy_ratio < 0.8:
+        warnings.append(f"Sell pressure: {buy_ratio:.1f}x ratio")
+
+    # ── Price Momentum (20%) ─────────────────────────────────────────────────
+    price_change = data.get("price_change_1h_pct", 0)
+    if price_change >= 100:     pscore = 10.0
+    elif price_change >= 50:    pscore = 8.5
+    elif price_change >= 20:    pscore = 7.0
+    elif price_change >= 10:    pscore = 5.5
+    elif price_change >= 0:     pscore = 4.0
+    elif price_change >= -10:   pscore = 3.0
+    else:                       pscore = 1.5
+
+    scores["price_momentum"] = pscore
+    if price_change >= 10:
+        signals.append(f"Price +{price_change:.1f}% (1h)")
+    if price_change < -20:
+        warnings.append(f"Price dropping: {price_change:.1f}%")
+
+    # ── MCap Sweet Spot (20%) ────────────────────────────────────────────────
+    mcap = data.get("mcap_usd", 0)
+    if 20_000 <= mcap <= 60_000:    mscore = 10.0   # Best range — room to 5-10x
+    elif 10_000 <= mcap < 20_000:   mscore = 8.0
+    elif 60_000 < mcap <= 100_000:  mscore = 7.0
+    elif 5_000 <= mcap < 10_000:    mscore = 5.0
+    else:                            mscore = 2.0
+
+    scores["mcap_position"] = mscore
+    if mcap > 0:
+        signals.append(f"MCap: ${mcap:,.0f}")
+
+    # ── Final Score ──────────────────────────────────────────────────────────
+    weights = {"vol_spike": 0.35, "buy_pressure": 0.25, "price_momentum": 0.20, "mcap_position": 0.20}
+    final = sum(scores[k] * weights[k] for k in weights)
+    final = round(max(min(final, 10.0), 1.0), 2)
+
+    if final >= 7.5:    verdict = "STRONG BREAKOUT"
+    elif final >= 6.0:  verdict = "BUILDING MOMENTUM"
+    elif final >= 5.0:  verdict = "EARLY SIGNAL"
+    else:               verdict = "WEAK"
+
+    return {
+        "final_score": final,
+        "verdict": verdict,
+        "components": scores,
+        "signals": signals[:5],
+        "warnings": warnings[:3],
+        "vol_spike": vol_spike,
+    }
+
+
+def format_momentum_alert(data: dict, score: dict, narrative: dict) -> str:
+    mint = data.get("mint", "")
+    name = data.get("name", "?")
+    symbol = data.get("symbol", "?")
+    comps = score["components"]
+    vol_spike = score.get("vol_spike", 0)
+
+    is_cult = "cult" in f"{name} {symbol}".lower()
+
+    lines = [
+        "📈 <b>TekkiSniPer — MOMENTUM ALERT</b>",
+        "",
+        f"<b>{name}</b>  <code>${symbol}</code>",
+        f"<code>{mint}</code>",
+        "",
+        f"📊 <b>SCORE: {score['final_score']}/10</b>  {score['verdict']}",
+        f"<i>vol spike 35% | buy pressure 25% | price 20% | mcap 20%</i>",
+        "",
+    ]
+
+    if is_cult:
+        lines.insert(1, "🔥 <b>CULT TOKEN</b>")
+
+    if narrative.get("matched"):
+        lines.append(f"📡 Narrative:  <b>{narrative['keyword']}</b>  [{narrative['category']}]")
+
+    lines += [
+        f"💰 MCap:       <b>${data.get('mcap_usd', 0):,.0f}</b>",
+        f"💧 Liquidity:  <b>${data.get('liquidity_usd', 0):,.0f}</b>",
+        f"👥 Holders:    <b>{data.get('total_holders', 0)}</b>",
+        f"📈 Vol 1h:     <b>${data.get('volume_1h_usd', 0):,.0f}</b>",
+        f"🔥 Vol spike:  <b>{vol_spike:.1f}x</b> vs 6h avg",
+        f"📊 Buy/Sell:   <b>{data.get('buy_sell_ratio_1h', 0):.1f}x</b>",
+        f"💹 Price 1h:   <b>{data.get('price_change_1h_pct', 0):+.1f}%</b>",
+        f"👨‍💻 Dev holds:  <b>{data.get('dev_holds_pct', 0):.1f}%</b>",
+        "",
+        "<b>Score Breakdown</b>",
+        f"  vol spike    {comps.get('vol_spike', 0):.1f}  {'█' * int(comps.get('vol_spike', 0))}",
+        f"  buy pressure {comps.get('buy_pressure', 0):.1f}  {'█' * int(comps.get('buy_pressure', 0))}",
+        f"  price mom    {comps.get('price_momentum', 0):.1f}  {'█' * int(comps.get('price_momentum', 0))}",
+        f"  mcap pos     {comps.get('mcap_position', 0):.1f}  {'█' * int(comps.get('mcap_position', 0))}",
+    ]
+
+    if score["signals"]:
+        lines += [""] + [f"✅ {s}" for s in score["signals"]]
+    if score["warnings"]:
+        lines += [f"⚠️ {w}" for w in score["warnings"]]
+
+    lines += [
+        "",
+        f"🔗 <a href='https://dexscreener.com/solana/{mint}'>dexscreener</a>  "
+        f"<a href='https://gmgn.ai/sol/token/{mint}'>gmgn</a>  "
+        f"<a href='https://solscan.io/token/{mint}'>solscan</a>",
+        f"<i>🕐 {utcnow().strftime('%H:%M:%S UTC')}</i>",
+    ]
+
+    return "\n".join(lines)
+
+
+async def momentum_scanner():
+    """Main scanner loop — polls every 10 minutes for gaining Solana tokens."""
+    global total_alerts_fired
+    log.info("[SCANNER] Momentum scanner started")
+    await asyncio.sleep(10)  # Brief startup delay
+
     while True:
         try:
-            log.info("[WS] Connecting to Pump.fun...")
-            async with websockets.connect(
-                PUMP_WS_URL,
-                ping_interval=30,
-                ping_timeout=60,
-                close_timeout=10,
-                max_size=2**20,
-            ) as ws:
-                await ws.send(json.dumps({"method": "subscribeNewToken"}))
-                log.info("[WS] Subscribed")
-                delay = 5
-                async for raw in ws:
-                    try:
-                        asyncio.create_task(handle_token(json.loads(raw)))
-                    except json.JSONDecodeError:
-                        pass
-                    except Exception as e:
-                        log.error(f"[WS] Handler: {e}")
+            log.info(f"[SCANNER] Starting scan cycle...")
+            candidates = await fetch_momentum_candidates()
+            log.info(f"[SCANNER] {len(candidates)} candidates fetched")
+
+            fired = 0
+            for cand in candidates:
+                try:
+                    mint = cand.get("mint", "")
+                    if not mint or len(mint) < 32:
+                        continue
+
+                    # Never double-alert
+                    if mint in alerted_mints:
+                        continue
+
+                    # Need name/symbol — fetch from DexScreener if missing
+                    name = cand.get("name", "")
+                    symbol = cand.get("symbol", "")
+
+                    if not name or not symbol:
+                        dex = await fetch_dexscreener(mint)
+                        if not dex:
+                            continue
+                        # Get name/symbol from pair data
+                        async with httpx.AsyncClient(timeout=8) as client:
+                            resp = await client.get(
+                                f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+                                headers={"User-Agent": "Mozilla/5.0"})
+                            if resp.status_code == 200:
+                                pairs = resp.json().get("pairs") or []
+                                if pairs:
+                                    base = pairs[0].get("baseToken") or {}
+                                    name = base.get("name", "Unknown")
+                                    symbol = base.get("symbol", "???")
+                                    cand["name"] = name
+                                    cand["symbol"] = symbol
+                        if not name:
+                            continue
+
+                    # Blacklist check
+                    combined = f"{name} {symbol}".lower()
+                    if any(bl in combined for bl in BLACKLIST):
+                        continue
+
+                    # Enrich with full data if we don't have it yet
+                    if not cand.get("mcap_usd"):
+                        dex = await fetch_dexscreener(mint)
+                        cand.update({k: v for k, v in dex.items() if v})
+
+                    mcap = cand.get("mcap_usd", 0)
+                    liq = cand.get("liquidity_usd", 0)
+                    vol_1h = cand.get("volume_1h_usd", 0)
+
+                    # MCap range filter
+                    if not (SCAN_MIN_MCAP <= mcap <= SCAN_MAX_MCAP):
+                        continue
+
+                    # Must have some liquidity and volume
+                    if liq < 1000 or vol_1h < 500:
+                        continue
+
+                    # Volume spike filter — must show at least 2x spike vs 6h avg
+                    vol_6h = cand.get("volume_6h_usd", 0)
+                    avg_6h = vol_6h / 6 if vol_6h > 0 else 0
+                    if avg_6h > 0 and (vol_1h / avg_6h) < SCAN_MIN_VOL_SPIKE:
+                        continue
+
+                    # Get dev holds via Helius if available
+                    deployer = cand.get("deployer", "")
+                    if HELIUS_API_KEY and not cand.get("dev_holds_pct"):
+                        enriched, _ = await enrich_token(mint, name, symbol, deployer)
+                        cand["dev_holds_pct"] = enriched.get("dev_holds_pct", 0)
+                        cand["mint_authority_revoked"] = enriched.get("mint_authority_revoked", True)
+                        cand["freeze_authority_revoked"] = enriched.get("freeze_authority_revoked", True)
+
+                    # Dev holds filter
+                    dev_pct = cand.get("dev_holds_pct", 0)
+                    if dev_pct > MAX_DEV_HOLDS_PCT:
+                        log.info(f"  [SCANNER] {symbol} — dev holds {dev_pct:.1f}% — skip")
+                        continue
+
+                    # Narrative match
+                    narrative = match_narrative(name, symbol, "")
+
+                    # Score on momentum
+                    result = score_momentum(cand)
+                    score = result["final_score"]
+
+                    log.info(f"  [SCANNER] {name} (${symbol}) mcap=${mcap:,.0f} vol={vol_1h:,.0f} spike={result['vol_spike']:.1f}x score={score}")
+
+                    if score < ALERT_THRESHOLD:
+                        continue
+
+                    # Mark as alerted — never fire again
+                    alerted_mints.add(mint)
+                    async with alerts_lock:
+                        total_alerts_fired += 1
+
+                    # Send alert
+                    alert_text = format_momentum_alert(cand, result, narrative)
+                    await send_tg(alert_text)
+                    fired += 1
+
+                    # Track it
+                    entry_mcap = max(mcap, SCAN_MIN_MCAP)
+                    async with tracked_lock:
+                        t = TrackedToken(
+                            mint=mint, name=name, symbol=symbol,
+                            entry_mcap=entry_mcap, entry_score=score,
+                            narrative=narrative.get("keyword", "?"),
+                        )
+                        tracked[mint] = t
+                    asyncio.create_task(save_leaderboard())
+
+                    # Paper trade
+                    async with paper_lock:
+                        paper_buy(mint, name, symbol, entry_mcap, score, "momentum")
+                    asyncio.create_task(save_paper_trades())
+
+                    await asyncio.sleep(1)  # Pace alerts
+
+                except Exception as e:
+                    log.error(f"[SCANNER] Candidate error: {e}")
+                    continue
+
+            log.info(f"[SCANNER] Cycle done — {fired} alerts fired. Next scan in {SCAN_INTERVAL_SEC//60}min.")
+
         except Exception as e:
-            log.warning(f"[WS] {e}")
-        sleep = min(delay + random.random() * 2, 30)
-        log.info(f"[WS] Reconnecting in {sleep:.0f}s...")
-        await asyncio.sleep(sleep)
-        delay = min(delay * 2, 30)
+            log.error(f"[SCANNER] Cycle error: {e}")
+
+        await asyncio.sleep(SCAN_INTERVAL_SEC)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2918,9 +3265,9 @@ async def run():
         cat_counts[cat] = cat_counts.get(cat, 0) + 1
 
     log.info("=" * 50)
-    log.info("  TekkiSniPer — BOT ONLINE [v4.0 CLEAN]")
-    log.info(f"  Threshold: {ALERT_THRESHOLD}  MinMCap: ${MIN_MCAP:,.0f}  MaxMCap: ${MAX_MCAP:,.0f}")
-    log.info(f"  MaxDevHolds: {MAX_DEV_HOLDS_PCT}%  Wait: {WAIT_SECONDS}s")
+    log.info("  TekkiSniPer — MOMENTUM SCANNER [v5.0]")
+    log.info(f"  Threshold: {ALERT_THRESHOLD}  MCap: ${SCAN_MIN_MCAP:,.0f}-${SCAN_MAX_MCAP:,.0f}  ScanInterval: {SCAN_INTERVAL_SEC//60}min")
+    log.info(f"  MaxDevHolds: {MAX_DEV_HOLDS_PCT}%  VolSpike: {SCAN_MIN_VOL_SPIKE}x")
     log.info(f"  Keywords: {kw_count} across {len(cat_counts)} categories")
     for cat, count in sorted(cat_counts.items()):
         log.info(f"    {cat}: {count} keywords")
@@ -2933,14 +3280,15 @@ async def run():
         await asyncio.sleep(2)
 
     await send_tg(
-        "🎯 <b>TekkiSniPer ONLINE [v4.0]</b>\n"
-        f"Threshold: {ALERT_THRESHOLD}/10  |  Min MCap: ${MIN_MCAP:,.0f}\n"
-        f"Keywords: {kw_count} ({', '.join(f'{c}:{n}' for c, n in sorted(cat_counts.items()))})\n"
-        f"<i>Watching Pump.fun live...</i>"
+        "📈 <b>TekkiSniPer MOMENTUM SCANNER [v5.0]</b>\n"
+        f"Scanning Solana every {SCAN_INTERVAL_SEC//60}min\n"
+        f"MCap: ${SCAN_MIN_MCAP:,.0f}–${SCAN_MAX_MCAP:,.0f}  |  Threshold: {ALERT_THRESHOLD}/10\n"
+        f"Vol spike min: {SCAN_MIN_VOL_SPIKE}x\n"
+        f"<i>Hunting momentum across all Solana tokens...</i>"
     )
 
     tasks = [
-        asyncio.create_task(ws_loop()),
+        asyncio.create_task(momentum_scanner()),
         asyncio.create_task(track_tokens()),
         asyncio.create_task(leaderboard_scheduler()),
         asyncio.create_task(handle_commands()),
@@ -2961,5 +3309,3 @@ if __name__ == "__main__":
         log.info("Interrupted")
     except Exception as e:
         log.critical(f"Fatal: {e}"); raise
-                        
-        
