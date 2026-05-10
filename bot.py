@@ -1,3 +1,4 @@
+
 """
 TekkiSniPer v4.0 — CLEAN BUILD
 Pump.fun → Narrative Match → Simple Score → Telegram Alert
@@ -2927,82 +2928,86 @@ def _parse_dex_pair(pair: dict) -> dict | None:
 async def fetch_dexscreener_gainers() -> list:
     """
     Pull gaining Solana tokens from DexScreener.
-    Uses the gainers endpoint + raydium/pump.fun pair searches to find
-    active tokens with volume in the $5k-$100k mcap range.
+    Strategy: use /latest/dex/tokens/solana which returns active pairs,
+    then for any missing names fetch via /latest/dex/tokens/{mint}.
     """
     results = {}  # mint -> data, deduped
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
 
-            # ── 1. DexScreener gainers (top price movers) ──────────────────
-            for timeframe in ["h1", "h6"]:
+            # ── Primary: active Solana tokens endpoint ────────────────────
+            try:
+                resp = await client.get(
+                    "https://api.dexscreener.com/latest/dex/tokens/solana",
+                    headers={"User-Agent": "Mozilla/5.0"})
+                if resp.status_code == 200:
+                    pairs = resp.json().get("pairs") or []
+                    log.info(f"[SCANNER] DexScreener /tokens/solana: {len(pairs)} pairs")
+                    for pair in pairs:
+                        if pair.get("chainId") != "solana":
+                            continue
+                        base = pair.get("baseToken") or {}
+                        mint = base.get("address", "")
+                        if not mint or mint in results:
+                            continue
+                        mc     = float(pair.get("marketCap") or pair.get("fdv") or 0)
+                        vol_1h = float((pair.get("volume") or {}).get("h1") or 0)
+                        vol_6h = float((pair.get("volume") or {}).get("h6") or 0)
+                        liq    = float((pair.get("liquidity") or {}).get("usd") or 0)
+                        if not (SCAN_MIN_MCAP <= mc <= SCAN_MAX_MCAP):
+                            continue
+                        if vol_1h < 300:
+                            continue
+                        results[mint] = {
+                            "mint":                mint,
+                            "name":                base.get("name", ""),
+                            "symbol":              base.get("symbol", ""),
+                            "mcap_usd":            mc,
+                            "liquidity_usd":       liq,
+                            "volume_1h_usd":       vol_1h,
+                            "volume_6h_usd":       vol_6h,
+                            "price_change_1h_pct": float((pair.get("priceChange") or {}).get("h1") or 0),
+                            "buy_sell_ratio_1h":   _safe_int((pair.get("txns") or {}).get("h1", {}).get("buys")) /
+                                                   max(_safe_int((pair.get("txns") or {}).get("h1", {}).get("sells")), 1),
+                            "total_holders":       _safe_int(pair.get("holders"), 0),
+                            "source":              "dexscreener",
+                        }
+            except Exception as e:
+                log.warning(f"[SCANNER] DexScreener /tokens/solana error: {e}")
+
+            # ── Enrich missing names via per-mint lookup ───────────────────
+            # Batch: look up mints that have no name, up to 20 at a time
+            no_name = [m for m, d in results.items() if not d.get("name")]
+            log.info(f"[SCANNER] {len(results)} candidates, {len(no_name)} need name lookup")
+            for mint in no_name[:20]:
                 try:
-                    resp = await client.get(
-                        f"https://api.dexscreener.com/latest/dex/tokens/trending/solana/{timeframe}",
+                    r = await client.get(
+                        f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
                         headers={"User-Agent": "Mozilla/5.0"})
-                    if resp.status_code == 200:
-                        pairs = resp.json().get("pairs") or []
-                        for pair in pairs[:100]:
-                            parsed = _parse_dex_pair(pair)
-                            if parsed and parsed["mint"] not in results:
-                                results[parsed["mint"]] = parsed
-                        log.info(f"[SCANNER] DexScreener trending/{timeframe}: {len(pairs)} pairs")
-                    await asyncio.sleep(0.5)
-                except Exception as e:
-                    log.warning(f"[SCANNER] DexScreener trending/{timeframe} error: {e}")
-
-            # ── 2. Raydium pairs — most active Solana DEX ─────────────────
-            try:
-                resp = await client.get(
-                    "https://api.dexscreener.com/latest/dex/pairs/solana/raydium",
-                    headers={"User-Agent": "Mozilla/5.0"})
-                if resp.status_code == 200:
-                    pairs = resp.json().get("pairs") or []
-                    # Sort by 1h volume descending to get the most active
-                    pairs.sort(key=lambda p: float((p.get("volume") or {}).get("h1") or 0), reverse=True)
-                    for pair in pairs[:200]:
-                        parsed = _parse_dex_pair(pair)
-                        if parsed and parsed["mint"] not in results:
-                            results[parsed["mint"]] = parsed
-                    log.info(f"[SCANNER] DexScreener raydium: {len(pairs)} pairs")
-                await asyncio.sleep(0.5)
-            except Exception as e:
-                log.warning(f"[SCANNER] DexScreener raydium error: {e}")
-
-            # ── 3. Pump.fun pairs ─────────────────────────────────────────
-            try:
-                resp = await client.get(
-                    "https://api.dexscreener.com/latest/dex/pairs/solana/pumpfun",
-                    headers={"User-Agent": "Mozilla/5.0"})
-                if resp.status_code == 200:
-                    pairs = resp.json().get("pairs") or []
-                    pairs.sort(key=lambda p: float((p.get("volume") or {}).get("h1") or 0), reverse=True)
-                    for pair in pairs[:200]:
-                        parsed = _parse_dex_pair(pair)
-                        if parsed and parsed["mint"] not in results:
-                            results[parsed["mint"]] = parsed
-                    log.info(f"[SCANNER] DexScreener pumpfun: {len(pairs)} pairs")
-                await asyncio.sleep(0.5)
-            except Exception as e:
-                log.warning(f"[SCANNER] DexScreener pumpfun error: {e}")
-
-            # ── 4. Meteora pairs ──────────────────────────────────────────
-            try:
-                resp = await client.get(
-                    "https://api.dexscreener.com/latest/dex/pairs/solana/meteora",
-                    headers={"User-Agent": "Mozilla/5.0"})
-                if resp.status_code == 200:
-                    pairs = resp.json().get("pairs") or []
-                    pairs.sort(key=lambda p: float((p.get("volume") or {}).get("h1") or 0), reverse=True)
-                    for pair in pairs[:100]:
-                        parsed = _parse_dex_pair(pair)
-                        if parsed and parsed["mint"] not in results:
-                            results[parsed["mint"]] = parsed
-                    log.info(f"[SCANNER] DexScreener meteora: {len(pairs)} pairs")
-                await asyncio.sleep(0.5)
-            except Exception as e:
-                log.warning(f"[SCANNER] DexScreener meteora error: {e}")
+                    if r.status_code == 200:
+                        pairs = r.json().get("pairs") or []
+                        if pairs:
+                            # Pick best pair by liquidity
+                            best = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
+                            base = best.get("baseToken") or {}
+                            name = base.get("name", "")
+                            symbol = base.get("symbol", "")
+                            if name:
+                                results[mint]["name"] = name
+                                results[mint]["symbol"] = symbol
+                                # Also refresh data from best pair
+                                mc     = float(best.get("marketCap") or best.get("fdv") or 0)
+                                vol_1h = float((best.get("volume") or {}).get("h1") or 0)
+                                vol_6h = float((best.get("volume") or {}).get("h6") or 0)
+                                liq    = float((best.get("liquidity") or {}).get("usd") or 0)
+                                if mc:   results[mint]["mcap_usd"] = mc
+                                if vol_1h: results[mint]["volume_1h_usd"] = vol_1h
+                                if vol_6h: results[mint]["volume_6h_usd"] = vol_6h
+                                if liq:  results[mint]["liquidity_usd"] = liq
+                    await asyncio.sleep(0.2)
+                except Exception:
+                    pass
 
     except Exception as e:
         log.warning(f"[SCANNER] DexScreener fetch error: {e}")
