@@ -3244,14 +3244,17 @@ async def momentum_scanner():
                     if any(bl in f"{name} {symbol}".lower() for bl in BLACKLIST):
                         continue
 
-                    # Vol spike using DexScreener h6 data (already in cand)
+                    # Vol spike using DexScreener h6 data
                     avg_6h = vol_6h / 6 if vol_6h > 0 else 0
                     vol_spike = round(vol_1h / avg_6h, 2) if avg_6h > 0 else 0
-                    log.info(f"  [SCANNER] {name} (${symbol}) mcap=${mcap:,.0f} vol1h=${vol_1h:,.0f} vol6h=${vol_6h:,.0f} spike={vol_spike}x")
+                    cand["volume_6h_usd"] = vol_6h
+                    log.info(f"  [SCANNER] {name} (${symbol}) mcap=${mcap:,.0f} vol1h=${vol_1h:,.0f} vol6h=${vol_6h:,.0f} spike={vol_spike}x liq=${liq:,.0f}")
 
+                    # Only filter on spike if we have 6h data — otherwise let score decide
                     if avg_6h > 0 and vol_spike < SCAN_MIN_VOL_SPIKE:
                         log.info(f"  [SCANNER] {symbol} — spike {vol_spike}x < {SCAN_MIN_VOL_SPIKE}x — skip")
                         continue
+                    # If no 6h data (vol_6h=0), still allow through — score_momentum handles it
 
                     # Dev holds — only call Helius for tokens that passed spike filter
                     dev_pct = cand.get("dev_holds_pct", 0)
@@ -3275,8 +3278,9 @@ async def momentum_scanner():
                     result = score_momentum(cand)
                     score  = result["final_score"]
                     spike  = result["vol_spike"]
+                    comps  = result["components"]
 
-                    log.info(f"  [SCANNER] {name} (${symbol}) mcap=${mcap:,.0f} vol=${vol_1h:,.0f} spike={spike:.1f}x score={score}")
+                    log.info(f"  [SCANNER] {name} (${symbol}) mcap=${mcap:,.0f} vol=${vol_1h:,.0f} spike={spike:.1f}x score={score} [vs={comps.get('vol_spike',0):.1f} bp={comps.get('buy_pressure',0):.1f} pm={comps.get('price_momentum',0):.1f} mp={comps.get('mcap_position',0):.1f}]")
 
                     if score < ALERT_THRESHOLD:
                         continue
