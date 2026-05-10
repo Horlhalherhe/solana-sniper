@@ -2884,51 +2884,102 @@ async def lifecycle_tracker(mint, name, symbol, deployer, desc, narrative, entry
 async def fetch_birdeye_trending() -> list:
     """
     Pull trending Solana tokens from Birdeye sorted by 1h volume change.
-    Returns list of dicts with name, symbol, mint, mcap, vol_1h, vol_6h, etc.
-    Birdeye gives us both 1h and 6h volume so we can compute real vol spike.
+    Tries multiple endpoints for resilience — Birdeye changes APIs frequently.
     """
     results = []
     if not BIRDEYE_API_KEY:
         return results
+
+    # Try endpoints in order until one works
+    endpoints = [
+        ("https://public-api.birdeye.so/defi/tokenlist", {
+            "sort_by": "v1hChangePercent", "sort_type": "desc",
+            "offset": 0, "limit": 100, "min_liquidity": 1000,
+        }),
+        ("https://public-api.birdeye.so/v1/token/list", {
+            "sort_by": "v1hChangePercent", "sort_type": "desc",
+            "offset": 0, "limit": 100, "min_liquidity": 1000,
+        }),
+        ("https://public-api.birdeye.so/defi/token_list", {
+            "sort_by": "v1hChangePercent", "sort_type": "desc",
+            "offset": 0, "limit": 100, "min_liquidity": 1000,
+        }),
+    ]
+
     try:
         async with httpx.AsyncClient(timeout=12) as client:
-            resp = await client.get(
-                "https://public-api.birdeye.so/defi/token_list",
-                params={
-                    "sort_by": "v1hChangePercent",
-                    "sort_type": "desc",
-                    "offset": 0,
-                    "limit": 100,
-                    "min_liquidity": 1000,
-                },
-                headers={"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana"})
-            if resp.status_code == 200:
-                tokens = (resp.json().get("data") or {}).get("tokens") or []
-                for t in tokens:
-                    mc = float(t.get("mc") or 0)
-                    if not (SCAN_MIN_MCAP <= mc <= SCAN_MAX_MCAP):
-                        continue
-                    vol_1h = float(t.get("v1hUSD") or 0)
-                    vol_6h = float(t.get("v6hUSD") or 0)
-                    if vol_1h < 300:
-                        continue
-                    results.append({
-                        "mint":               t.get("address", ""),
-                        "name":               t.get("name", ""),
-                        "symbol":             t.get("symbol", ""),
-                        "mcap_usd":           mc,
-                        "liquidity_usd":      float(t.get("liquidity") or 0),
-                        "volume_1h_usd":      vol_1h,
-                        "volume_6h_usd":      vol_6h,
-                        "price_change_1h_pct": float(t.get("v1hChangePercent") or 0),
-                        "buy_sell_ratio_1h":  int(t.get("buy1h") or 1) / max(int(t.get("sell1h") or 1), 1),
-                        "total_holders":      int(t.get("holder") or 0),
-                        "source":             "birdeye",
-                    })
-            else:
-                log.warning(f"[SCANNER] Birdeye token_list returned {resp.status_code}")
+            for url, params in endpoints:
+                try:
+                    resp = await client.get(
+                        url, params=params,
+                        headers={"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana"})
+                    if resp.status_code == 200:
+                        data = resp.json().get("data") or {}
+                        # Handle both {"tokens": [...]} and {"items": [...]} shapes
+                        tokens = data.get("tokens") or data.get("items") or []
+                        if not tokens and isinstance(data, list):
+                            tokens = data
+                        log.info(f"[SCANNER] Birdeye {url.split('/')[-1]} returned {len(tokens)} tokens")
+                        for t in tokens:
+                            mc = float(t.get("mc") or t.get("marketCap") or 0)
+                            if not (SCAN_MIN_MCAP <= mc <= SCAN_MAX_MCAP):
+                                continue
+                            vol_1h = float(t.get("v1hUSD") or t.get("volume1hUSD") or 0)
+                            vol_6h = float(t.get("v6hUSD") or t.get("volume6hUSD") or 0)
+                            if vol_1h < 300:
+                                continue
+                            results.append({
+                                "mint":                t.get("address", ""),
+                                "name":                t.get("name", ""),
+                                "symbol":              t.get("symbol", ""),
+                                "mcap_usd":            mc,
+                                "liquidity_usd":       float(t.get("liquidity") or 0),
+                                "volume_1h_usd":       vol_1h,
+                                "volume_6h_usd":       vol_6h,
+                                "price_change_1h_pct": float(t.get("v1hChangePercent") or t.get("priceChange1hPercent") or 0),
+                                "buy_sell_ratio_1h":   int(t.get("buy1h") or 1) / max(int(t.get("sell1h") or 1), 1),
+                                "total_holders":       int(t.get("holder") or 0),
+                                "source":              "birdeye",
+                            })
+                        break  # Success — stop trying other endpoints
+                    else:
+                        log.warning(f"[SCANNER] Birdeye {url.split('/')[-1]} returned {resp.status_code}")
+                except Exception as e:
+                    log.warning(f"[SCANNER] Birdeye endpoint {url.split('/')[-1]} error: {e}")
     except Exception as e:
         log.warning(f"[SCANNER] Birdeye fetch error: {e}")
+
+    # Fallback: if list endpoint failed, grab trending tokens via token_trending
+    if not results and BIRDEYE_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=12) as client:
+                resp = await client.get(
+                    "https://public-api.birdeye.so/defi/token_trending",
+                    params={"sort_by": "rank", "sort_type": "asc", "offset": 0, "limit": 20},
+                    headers={"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana"})
+                if resp.status_code == 200:
+                    tokens = (resp.json().get("data") or {}).get("tokens") or []
+                    log.info(f"[SCANNER] Birdeye token_trending fallback: {len(tokens)} tokens")
+                    for t in tokens:
+                        mc = float(t.get("mc") or 0)
+                        if not (SCAN_MIN_MCAP <= mc <= SCAN_MAX_MCAP):
+                            continue
+                        results.append({
+                            "mint":                t.get("address", ""),
+                            "name":                t.get("name", ""),
+                            "symbol":              t.get("symbol", ""),
+                            "mcap_usd":            mc,
+                            "liquidity_usd":       float(t.get("liquidity") or 0),
+                            "volume_1h_usd":       float(t.get("v1hUSD") or 0),
+                            "volume_6h_usd":       float(t.get("v6hUSD") or 0),
+                            "price_change_1h_pct": float(t.get("v1hChangePercent") or 0),
+                            "buy_sell_ratio_1h":   int(t.get("buy1h") or 1) / max(int(t.get("sell1h") or 1), 1),
+                            "total_holders":       int(t.get("holder") or 0),
+                            "source":              "birdeye_trending",
+                        })
+        except Exception as e:
+            log.warning(f"[SCANNER] Birdeye trending fallback error: {e}")
+
     return results
 
 
