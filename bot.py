@@ -1,4 +1,3 @@
-
 """
 TekkiSniPer v4.0 — CLEAN BUILD
 Pump.fun → Narrative Match → Simple Score → Telegram Alert
@@ -2882,138 +2881,126 @@ async def lifecycle_tracker(mint, name, symbol, deployer, desc, narrative, entry
 # ═══════════════════════════════════════════════════════════════════════════════
 # WEBSOCKET LOOP
 # ═══════════════════════════════════════════════════════════════════════════════
-async def fetch_birdeye_trending() -> list:
+async def fetch_momentum_candidates() -> list:
     """
-    Birdeye list endpoints are unreliable. Instead, we use DexScreener to get
-    candidate mints, then enrich each with Birdeye token_overview (which works)
-    to get accurate 6h volume for spike calculation.
+    Fetch active Solana tokens using multiple reliable sources.
+    
+    Strategy:
+    1. Jupiter token list — comprehensive list of all verified Solana tokens
+    2. Helius getTokensWithMetadata — on-chain active tokens
+    3. For each candidate mint, get momentum data from Birdeye token_overview
+       (the one endpoint we KNOW works) to get vol_1h, vol_6h, mcap, buy/sell
+    
+    This avoids DexScreener list endpoints which are unreliable/rate-limited.
     """
-    return []  # Handled inside momentum_scanner via per-token enrichment
+    candidate_mints = {}  # mint -> basic info
 
+    async with httpx.AsyncClient(timeout=15) as client:
 
-def _parse_dex_pair(pair: dict) -> dict | None:
-    """Extract token data from a DexScreener pair object. Returns None if invalid."""
-    if pair.get("chainId") != "solana":
-        return None
-    base = pair.get("baseToken") or {}
-    mint = base.get("address", "")
-    name = base.get("name", "")
-    symbol = base.get("symbol", "")
-    if not mint or not name:
-        return None
-    mc     = float(pair.get("marketCap") or pair.get("fdv") or 0)
-    vol_1h = float((pair.get("volume") or {}).get("h1") or 0)
-    vol_6h = float((pair.get("volume") or {}).get("h6") or 0)
-    liq    = float((pair.get("liquidity") or {}).get("usd") or 0)
-    if not (SCAN_MIN_MCAP <= mc <= SCAN_MAX_MCAP):
-        return None
-    if vol_1h < 300:
-        return None
-    return {
-        "mint":                mint,
-        "name":                name,
-        "symbol":              symbol,
-        "mcap_usd":            mc,
-        "liquidity_usd":       liq,
-        "volume_1h_usd":       vol_1h,
-        "volume_6h_usd":       vol_6h,
-        "price_change_1h_pct": float((pair.get("priceChange") or {}).get("h1") or 0),
-        "buy_sell_ratio_1h":   _safe_int((pair.get("txns") or {}).get("h1", {}).get("buys")) /
-                               max(_safe_int((pair.get("txns") or {}).get("h1", {}).get("sells")), 1),
-        "total_holders":       _safe_int(pair.get("holders"), 0),
-        "source":              "dexscreener",
-    }
+        # ── Source 1: Jupiter verified token list (no auth needed) ────────
+        try:
+            resp = await client.get(
+                "https://token.jup.ag/strict",
+                headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code == 200:
+                tokens = resp.json()
+                # Jupiter returns all verified tokens — sample a rotating window
+                # Use current minute to rotate which tokens we check each cycle
+                import time
+                offset = (int(time.time()) // SCAN_INTERVAL_SEC) % max(1, len(tokens) // 200)
+                window = tokens[offset * 200 : offset * 200 + 200]
+                for t in window:
+                    mint = t.get("address", "")
+                    if mint:
+                        candidate_mints[mint] = {
+                            "name": t.get("name", ""),
+                            "symbol": t.get("symbol", ""),
+                        }
+                log.info(f"[SCANNER] Jupiter: {len(tokens)} total tokens, checking window of {len(window)}")
+            else:
+                log.warning(f"[SCANNER] Jupiter token list: {resp.status_code}")
+        except Exception as e:
+            log.warning(f"[SCANNER] Jupiter error: {e}")
 
+        # ── Source 2: Birdeye trending (even if list fails, trending works) ─
+        if BIRDEYE_API_KEY:
+            for endpoint in [
+                "https://public-api.birdeye.so/defi/token_trending",
+                "https://public-api.birdeye.so/v1/token/trending",
+            ]:
+                try:
+                    resp = await client.get(
+                        endpoint,
+                        params={"sort_by": "rank", "sort_type": "asc", "limit": 50},
+                        headers={"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana"})
+                    if resp.status_code == 200:
+                        data = resp.json().get("data") or {}
+                        tokens = data.get("tokens") or data.get("items") or []
+                        for t in tokens:
+                            mint = t.get("address", "")
+                            if mint and mint not in candidate_mints:
+                                candidate_mints[mint] = {
+                                    "name": t.get("name", ""),
+                                    "symbol": t.get("symbol", ""),
+                                }
+                        log.info(f"[SCANNER] Birdeye trending: {len(tokens)} tokens")
+                        break
+                    else:
+                        log.warning(f"[SCANNER] Birdeye trending {endpoint.split('/')[-1]}: {resp.status_code}")
+                except Exception as e:
+                    log.warning(f"[SCANNER] Birdeye trending error: {e}")
 
-async def fetch_dexscreener_gainers() -> list:
-    """
-    Pull gaining Solana tokens from DexScreener.
-    Strategy: use /latest/dex/tokens/solana which returns active pairs,
-    then for any missing names fetch via /latest/dex/tokens/{mint}.
-    """
-    results = {}  # mint -> data, deduped
+        # ── Source 3: DexScreener per-mint lookup for momentum data ────────
+        # For each candidate, use Birdeye token_overview to get vol data
+        results = []
+        checked = 0
+        log.info(f"[SCANNER] Checking {len(candidate_mints)} candidates for momentum...")
 
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-
-            # ── Primary: active Solana tokens endpoint ────────────────────
+        for mint, basic in list(candidate_mints.items())[:150]:
+            if mint in alerted_mints:
+                continue
             try:
-                resp = await client.get(
-                    "https://api.dexscreener.com/latest/dex/tokens/solana",
-                    headers={"User-Agent": "Mozilla/5.0"})
-                if resp.status_code == 200:
-                    pairs = resp.json().get("pairs") or []
-                    log.info(f"[SCANNER] DexScreener /tokens/solana: {len(pairs)} pairs")
-                    for pair in pairs:
-                        if pair.get("chainId") != "solana":
-                            continue
-                        base = pair.get("baseToken") or {}
-                        mint = base.get("address", "")
-                        if not mint or mint in results:
-                            continue
-                        mc     = float(pair.get("marketCap") or pair.get("fdv") or 0)
-                        vol_1h = float((pair.get("volume") or {}).get("h1") or 0)
-                        vol_6h = float((pair.get("volume") or {}).get("h6") or 0)
-                        liq    = float((pair.get("liquidity") or {}).get("usd") or 0)
+                # Use Birdeye token_overview — KNOWN to work, gives vol_1h + vol_6h
+                if BIRDEYE_API_KEY:
+                    resp = await client.get(
+                        "https://public-api.birdeye.so/defi/token_overview",
+                        params={"address": mint},
+                        headers={"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana"})
+                    if resp.status_code == 200:
+                        d = resp.json().get("data") or {}
+                        mc     = float(d.get("mc") or 0)
+                        liq    = float(d.get("liquidity") or 0)
+                        vol_1h = float(d.get("v1hUSD") or 0)
+                        vol_6h = float(d.get("v6hUSD") or 0)
+                        name   = d.get("name", "") or basic.get("name", "")
+                        symbol = d.get("symbol", "") or basic.get("symbol", "")
+
+                        # Quick pre-filter before adding
                         if not (SCAN_MIN_MCAP <= mc <= SCAN_MAX_MCAP):
                             continue
-                        if vol_1h < 300:
+                        if liq < 1000 or vol_1h < 300:
                             continue
-                        results[mint] = {
+
+                        results.append({
                             "mint":                mint,
-                            "name":                base.get("name", ""),
-                            "symbol":              base.get("symbol", ""),
+                            "name":                name,
+                            "symbol":              symbol,
                             "mcap_usd":            mc,
                             "liquidity_usd":       liq,
                             "volume_1h_usd":       vol_1h,
                             "volume_6h_usd":       vol_6h,
-                            "price_change_1h_pct": float((pair.get("priceChange") or {}).get("h1") or 0),
-                            "buy_sell_ratio_1h":   _safe_int((pair.get("txns") or {}).get("h1", {}).get("buys")) /
-                                                   max(_safe_int((pair.get("txns") or {}).get("h1", {}).get("sells")), 1),
-                            "total_holders":       _safe_int(pair.get("holders"), 0),
-                            "source":              "dexscreener",
-                        }
-            except Exception as e:
-                log.warning(f"[SCANNER] DexScreener /tokens/solana error: {e}")
+                            "price_change_1h_pct": float(d.get("priceChange1hPercent") or 0),
+                            "buy_sell_ratio_1h":   int(d.get("buy1h") or 1) / max(int(d.get("sell1h") or 1), 1),
+                            "total_holders":       int(d.get("holder") or 0),
+                            "source":              "birdeye_overview",
+                        })
+                        checked += 1
+                await asyncio.sleep(0.1)  # Rate limit Birdeye
+            except Exception:
+                continue
 
-            # ── Enrich missing names via per-mint lookup ───────────────────
-            # Batch: look up mints that have no name, up to 20 at a time
-            no_name = [m for m, d in results.items() if not d.get("name")]
-            log.info(f"[SCANNER] {len(results)} candidates, {len(no_name)} need name lookup")
-            for mint in no_name[:20]:
-                try:
-                    r = await client.get(
-                        f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-                        headers={"User-Agent": "Mozilla/5.0"})
-                    if r.status_code == 200:
-                        pairs = r.json().get("pairs") or []
-                        if pairs:
-                            # Pick best pair by liquidity
-                            best = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
-                            base = best.get("baseToken") or {}
-                            name = base.get("name", "")
-                            symbol = base.get("symbol", "")
-                            if name:
-                                results[mint]["name"] = name
-                                results[mint]["symbol"] = symbol
-                                # Also refresh data from best pair
-                                mc     = float(best.get("marketCap") or best.get("fdv") or 0)
-                                vol_1h = float((best.get("volume") or {}).get("h1") or 0)
-                                vol_6h = float((best.get("volume") or {}).get("h6") or 0)
-                                liq    = float((best.get("liquidity") or {}).get("usd") or 0)
-                                if mc:   results[mint]["mcap_usd"] = mc
-                                if vol_1h: results[mint]["volume_1h_usd"] = vol_1h
-                                if vol_6h: results[mint]["volume_6h_usd"] = vol_6h
-                                if liq:  results[mint]["liquidity_usd"] = liq
-                    await asyncio.sleep(0.2)
-                except Exception:
-                    pass
-
-    except Exception as e:
-        log.warning(f"[SCANNER] DexScreener fetch error: {e}")
-
-    log.info(f"[SCANNER] DexScreener: {len(results)} unique candidates with full data")
-    return list(results.values())
+        log.info(f"[SCANNER] {checked} tokens checked via Birdeye, {len(results)} passed pre-filter")
+        return results
 
 def score_momentum(data: dict) -> dict:
     """Score a token on momentum signals — for established tokens breaking out."""
@@ -3172,8 +3159,8 @@ async def momentum_scanner():
             log.info("[SCANNER] Starting scan cycle...")
 
             # Fetch candidates from DexScreener (multiple endpoints)
-            candidates = await fetch_dexscreener_gainers()
-            log.info(f"[SCANNER] {len(candidates)} candidates fetched from DexScreener")
+            candidates = await fetch_momentum_candidates()
+            log.info(f"[SCANNER] {len(candidates)} candidates ready for scoring")
 
             fired = 0
             for cand in candidates:
