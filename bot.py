@@ -2927,51 +2927,82 @@ def _parse_dex_pair(pair: dict) -> dict | None:
 async def fetch_dexscreener_gainers() -> list:
     """
     Pull gaining Solana tokens from DexScreener.
-    Uses the /latest/dex/pairs/solana endpoint which returns full pair data
-    including name, symbol, volume h1/h6, mcap, liquidity, buy/sell txns.
+    Uses the gainers endpoint + raydium/pump.fun pair searches to find
+    active tokens with volume in the $5k-$100k mcap range.
     """
     results = {}  # mint -> data, deduped
 
-    # These endpoints return full pair objects with name/symbol/volume
-    search_queries = ["solana", "sol", "pump"]
-    pair_endpoints = [
-        "https://api.dexscreener.com/latest/dex/pairs/solana",
-        "https://api.dexscreener.com/latest/dex/search?q=solana+gainers",
-    ]
-
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            # Search queries — returns pairs with full token info
-            for q in search_queries:
+
+            # ── 1. DexScreener gainers (top price movers) ──────────────────
+            for timeframe in ["h1", "h6"]:
                 try:
                     resp = await client.get(
-                        f"https://api.dexscreener.com/latest/dex/search",
-                        params={"q": q},
+                        f"https://api.dexscreener.com/latest/dex/tokens/trending/solana/{timeframe}",
                         headers={"User-Agent": "Mozilla/5.0"})
                     if resp.status_code == 200:
                         pairs = resp.json().get("pairs") or []
-                        for pair in pairs[:200]:
+                        for pair in pairs[:100]:
                             parsed = _parse_dex_pair(pair)
                             if parsed and parsed["mint"] not in results:
                                 results[parsed["mint"]] = parsed
-                    await asyncio.sleep(0.3)
+                        log.info(f"[SCANNER] DexScreener trending/{timeframe}: {len(pairs)} pairs")
+                    await asyncio.sleep(0.5)
                 except Exception as e:
-                    log.warning(f"[SCANNER] DexScreener search '{q}' error: {e}")
+                    log.warning(f"[SCANNER] DexScreener trending/{timeframe} error: {e}")
 
-            # Pair listing endpoints
-            for url in pair_endpoints:
-                try:
-                    resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        pairs = data.get("pairs") or (data if isinstance(data, list) else [])
-                        for pair in pairs[:200]:
-                            parsed = _parse_dex_pair(pair)
-                            if parsed and parsed["mint"] not in results:
-                                results[parsed["mint"]] = parsed
-                    await asyncio.sleep(0.3)
-                except Exception as e:
-                    log.warning(f"[SCANNER] DexScreener pairs error: {e}")
+            # ── 2. Raydium pairs — most active Solana DEX ─────────────────
+            try:
+                resp = await client.get(
+                    "https://api.dexscreener.com/latest/dex/pairs/solana/raydium",
+                    headers={"User-Agent": "Mozilla/5.0"})
+                if resp.status_code == 200:
+                    pairs = resp.json().get("pairs") or []
+                    # Sort by 1h volume descending to get the most active
+                    pairs.sort(key=lambda p: float((p.get("volume") or {}).get("h1") or 0), reverse=True)
+                    for pair in pairs[:200]:
+                        parsed = _parse_dex_pair(pair)
+                        if parsed and parsed["mint"] not in results:
+                            results[parsed["mint"]] = parsed
+                    log.info(f"[SCANNER] DexScreener raydium: {len(pairs)} pairs")
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                log.warning(f"[SCANNER] DexScreener raydium error: {e}")
+
+            # ── 3. Pump.fun pairs ─────────────────────────────────────────
+            try:
+                resp = await client.get(
+                    "https://api.dexscreener.com/latest/dex/pairs/solana/pumpfun",
+                    headers={"User-Agent": "Mozilla/5.0"})
+                if resp.status_code == 200:
+                    pairs = resp.json().get("pairs") or []
+                    pairs.sort(key=lambda p: float((p.get("volume") or {}).get("h1") or 0), reverse=True)
+                    for pair in pairs[:200]:
+                        parsed = _parse_dex_pair(pair)
+                        if parsed and parsed["mint"] not in results:
+                            results[parsed["mint"]] = parsed
+                    log.info(f"[SCANNER] DexScreener pumpfun: {len(pairs)} pairs")
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                log.warning(f"[SCANNER] DexScreener pumpfun error: {e}")
+
+            # ── 4. Meteora pairs ──────────────────────────────────────────
+            try:
+                resp = await client.get(
+                    "https://api.dexscreener.com/latest/dex/pairs/solana/meteora",
+                    headers={"User-Agent": "Mozilla/5.0"})
+                if resp.status_code == 200:
+                    pairs = resp.json().get("pairs") or []
+                    pairs.sort(key=lambda p: float((p.get("volume") or {}).get("h1") or 0), reverse=True)
+                    for pair in pairs[:100]:
+                        parsed = _parse_dex_pair(pair)
+                        if parsed and parsed["mint"] not in results:
+                            results[parsed["mint"]] = parsed
+                    log.info(f"[SCANNER] DexScreener meteora: {len(pairs)} pairs")
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                log.warning(f"[SCANNER] DexScreener meteora error: {e}")
 
     except Exception as e:
         log.warning(f"[SCANNER] DexScreener fetch error: {e}")
