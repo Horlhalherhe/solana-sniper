@@ -3137,75 +3137,41 @@ async def momentum_scanner():
                     vol_6h = cand.get("volume_6h_usd", 0)
                     liq    = cand.get("liquidity_usd", 0)
 
-                    # Enrich via Birdeye token_overview — gets real 6h vol for spike calc
-                    if BIRDEYE_API_KEY:
-                        try:
-                            async with httpx.AsyncClient(timeout=8) as client:
-                                resp = await client.get(
-                                    "https://public-api.birdeye.so/defi/token_overview",
-                                    params={"address": mint},
-                                    headers={"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana"})
-                                if resp.status_code == 200:
-                                    d = resp.json().get("data") or {}
-                                    be_name   = d.get("name", "")
-                                    be_symbol = d.get("symbol", "")
-                                    be_mc     = float(d.get("mc") or 0)
-                                    be_liq    = float(d.get("liquidity") or 0)
-                                    be_v1h    = float(d.get("v1hUSD") or 0)
-                                    be_v6h    = float(d.get("v6hUSD") or 0)
-                                    be_br     = int(d.get("buy1h") or 1) / max(int(d.get("sell1h") or 1), 1)
-                                    be_holders = int(d.get("holder") or 0)
-                                    be_pct    = float(d.get("priceChange1hPercent") or 0)
-                                    # Always update with Birdeye data — more accurate
-                                    if be_name:   name   = be_name
-                                    if be_symbol: symbol = be_symbol
-                                    if be_mc:     mcap   = be_mc
-                                    if be_liq:    liq    = be_liq
-                                    if be_v1h:    vol_1h = be_v1h
-                                    if be_v6h:    vol_6h = be_v6h  # Key: real 6h vol
-                                    cand.update({
-                                        "name": name, "symbol": symbol,
-                                        "mcap_usd": mcap, "liquidity_usd": liq,
-                                        "volume_1h_usd": vol_1h, "volume_6h_usd": vol_6h,
-                                        "price_change_1h_pct": be_pct if be_pct else cand.get("price_change_1h_pct", 0),
-                                        "buy_sell_ratio_1h": be_br,
-                                        "total_holders": be_holders if be_holders else cand.get("total_holders", 0),
-                                    })
-                        except Exception:
-                            pass
-
+                    # Basic pre-filter before any API calls
                     if not name:
+                        log.info(f"  [SCANNER] {mint[:12]} — no name — skip")
+                        continue
+                    if not (SCAN_MIN_MCAP <= mcap <= SCAN_MAX_MCAP):
+                        log.info(f"  [SCANNER] {symbol} — mcap=${mcap:,.0f} out of range — skip")
+                        continue
+                    if liq < 1000 or vol_1h < 500:
+                        log.info(f"  [SCANNER] {symbol} — liq=${liq:,.0f} vol=${vol_1h:,.0f} too low — skip")
                         continue
 
                     # Blacklist check
                     if any(bl in f"{name} {symbol}".lower() for bl in BLACKLIST):
                         continue
 
-                    # MCap range
-                    if not (SCAN_MIN_MCAP <= mcap <= SCAN_MAX_MCAP):
-                        continue
-
-                    # Must have liquidity and volume
-                    if liq < 1000 or vol_1h < 500:
-                        continue
-
-                    # Vol spike check — key filter
+                    # Vol spike using DexScreener h6 data (already in cand)
                     avg_6h = vol_6h / 6 if vol_6h > 0 else 0
-                    vol_spike = (vol_1h / avg_6h) if avg_6h > 0 else 0
-                    if avg_6h > 0 and vol_spike < SCAN_MIN_VOL_SPIKE:
-                        continue
-                    # If no 6h data, don't filter out — score will reflect it
+                    vol_spike = round(vol_1h / avg_6h, 2) if avg_6h > 0 else 0
+                    log.info(f"  [SCANNER] {name} (${symbol}) mcap=${mcap:,.0f} vol1h=${vol_1h:,.0f} vol6h=${vol_6h:,.0f} spike={vol_spike}x")
 
-                    # Dev holds via Helius
+                    if avg_6h > 0 and vol_spike < SCAN_MIN_VOL_SPIKE:
+                        log.info(f"  [SCANNER] {symbol} — spike {vol_spike}x < {SCAN_MIN_VOL_SPIKE}x — skip")
+                        continue
+
+                    # Dev holds — only call Helius for tokens that passed spike filter
+                    dev_pct = cand.get("dev_holds_pct", 0)
                     if HELIUS_API_KEY and not cand.get("dev_holds_fetched"):
                         try:
                             enriched, _ = await enrich_token(mint, name, symbol, "")
-                            cand["dev_holds_pct"] = enriched.get("dev_holds_pct", 0)
+                            dev_pct = enriched.get("dev_holds_pct", 0)
+                            cand["dev_holds_pct"] = dev_pct
                             cand["dev_holds_fetched"] = True
                         except Exception:
                             pass
 
-                    dev_pct = cand.get("dev_holds_pct", 0)
                     if dev_pct > MAX_DEV_HOLDS_PCT:
                         log.info(f"  [SCANNER] {symbol} — dev {dev_pct:.1f}% — skip")
                         continue
