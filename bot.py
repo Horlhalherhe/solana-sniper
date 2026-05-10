@@ -2945,10 +2945,14 @@ async def fetch_momentum_candidates() -> list:
 
         # Add recently alerted tokens' neighbors via DexScreener search
         # Use DexScreener search with common meme terms — returns full pair data
-        meme_terms = ["pepe", "dog", "cat", "ai", "trump", "moon", "ape", "frog", "bear", "chad"]
+        meme_terms = [
+            "pepe", "dog", "cat", "ai", "trump", "moon", "ape", "frog", "bear", "chad",
+            "doge", "shib", "bonk", "wif", "meme", "sol", "pump", "based", "sigma",
+            "giga", "baby", "elon", "bitcoin", "eth", "defi", "nft", "gpt", "agent",
+        ]
         import random
-        # Only search 3 random terms per cycle to avoid rate limits
-        terms_this_cycle = random.sample(meme_terms, 3)
+        # Search 8 random terms per cycle for broad coverage
+        terms_this_cycle = random.sample(meme_terms, 8)
 
         for term in terms_this_cycle:
             try:
@@ -2970,10 +2974,13 @@ async def fetch_momentum_candidates() -> list:
                         symbol = base.get("symbol", "")
                         if not mint or not name:
                             continue
-                        if not (SCAN_MIN_MCAP <= mc <= SCAN_MAX_MCAP):
-                            continue
-                        if vol_1h < 300 or liq < 1000:
-                            continue
+                        # Wider pre-filter — scoring will handle weak signals
+                        if mc > 0 and mc > SCAN_MAX_MCAP * 2:
+                            continue  # Way too big
+                        if mc > 0 and mc < SCAN_MIN_MCAP / 2:
+                            continue  # Way too small
+                        if vol_1h < 100:
+                            continue  # No activity at all
                         # DexScreener already has all the data we need
                         candidate_mints[mint] = {
                             "name": name, "symbol": symbol,
