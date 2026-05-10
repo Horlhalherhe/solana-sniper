@@ -2890,73 +2890,93 @@ async def fetch_birdeye_trending() -> list:
     return []  # Handled inside momentum_scanner via per-token enrichment
 
 
+def _parse_dex_pair(pair: dict) -> dict | None:
+    """Extract token data from a DexScreener pair object. Returns None if invalid."""
+    if pair.get("chainId") != "solana":
+        return None
+    base = pair.get("baseToken") or {}
+    mint = base.get("address", "")
+    name = base.get("name", "")
+    symbol = base.get("symbol", "")
+    if not mint or not name:
+        return None
+    mc     = float(pair.get("marketCap") or pair.get("fdv") or 0)
+    vol_1h = float((pair.get("volume") or {}).get("h1") or 0)
+    vol_6h = float((pair.get("volume") or {}).get("h6") or 0)
+    liq    = float((pair.get("liquidity") or {}).get("usd") or 0)
+    if not (SCAN_MIN_MCAP <= mc <= SCAN_MAX_MCAP):
+        return None
+    if vol_1h < 300:
+        return None
+    return {
+        "mint":                mint,
+        "name":                name,
+        "symbol":              symbol,
+        "mcap_usd":            mc,
+        "liquidity_usd":       liq,
+        "volume_1h_usd":       vol_1h,
+        "volume_6h_usd":       vol_6h,
+        "price_change_1h_pct": float((pair.get("priceChange") or {}).get("h1") or 0),
+        "buy_sell_ratio_1h":   _safe_int((pair.get("txns") or {}).get("h1", {}).get("buys")) /
+                               max(_safe_int((pair.get("txns") or {}).get("h1", {}).get("sells")), 1),
+        "total_holders":       _safe_int(pair.get("holders"), 0),
+        "source":              "dexscreener",
+    }
+
+
 async def fetch_dexscreener_gainers() -> list:
     """
-    Pull Solana tokens from multiple DexScreener endpoints for broad coverage.
-    DexScreener h6 volume is available in pairs data — we use that for spike calc.
+    Pull gaining Solana tokens from DexScreener.
+    Uses the /latest/dex/pairs/solana endpoint which returns full pair data
+    including name, symbol, volume h1/h6, mcap, liquidity, buy/sell txns.
     """
     results = {}  # mint -> data, deduped
+
+    # These endpoints return full pair objects with name/symbol/volume
+    search_queries = ["solana", "sol", "pump"]
+    pair_endpoints = [
+        "https://api.dexscreener.com/latest/dex/pairs/solana",
+        "https://api.dexscreener.com/latest/dex/search?q=solana+gainers",
+    ]
+
     try:
-        async with httpx.AsyncClient(timeout=12) as client:
-            urls = [
-                "https://api.dexscreener.com/latest/dex/tokens/solana",
-                "https://api.dexscreener.com/token-boosts/top/v1",
-                "https://api.dexscreener.com/latest/dex/search?q=solana",
-            ]
-            for url in urls:
+        async with httpx.AsyncClient(timeout=15) as client:
+            # Search queries — returns pairs with full token info
+            for q in search_queries:
+                try:
+                    resp = await client.get(
+                        f"https://api.dexscreener.com/latest/dex/search",
+                        params={"q": q},
+                        headers={"User-Agent": "Mozilla/5.0"})
+                    if resp.status_code == 200:
+                        pairs = resp.json().get("pairs") or []
+                        for pair in pairs[:200]:
+                            parsed = _parse_dex_pair(pair)
+                            if parsed and parsed["mint"] not in results:
+                                results[parsed["mint"]] = parsed
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    log.warning(f"[SCANNER] DexScreener search '{q}' error: {e}")
+
+            # Pair listing endpoints
+            for url in pair_endpoints:
                 try:
                     resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-                    if resp.status_code != 200:
-                        log.warning(f"[SCANNER] DexScreener {url.split('/')[-1]} → {resp.status_code}")
-                        continue
-
-                    data = resp.json()
-                    # token-boosts returns a list directly
-                    if isinstance(data, list):
-                        for item in data[:100]:
-                            if item.get("chainId") != "solana":
-                                continue
-                            mint = item.get("tokenAddress", "")
-                            if mint and mint not in results:
-                                results[mint] = {"mint": mint, "source": "dex_boost"}
-                        continue
-
-                    pairs = data.get("pairs") or []
-                    for pair in pairs[:150]:
-                        if pair.get("chainId") != "solana":
-                            continue
-                        base = pair.get("baseToken") or {}
-                        mint = base.get("address", "")
-                        if not mint or mint in results:
-                            continue
-                        mc   = float(pair.get("marketCap") or pair.get("fdv") or 0)
-                        vol_1h = float((pair.get("volume") or {}).get("h1") or 0)
-                        vol_6h = float((pair.get("volume") or {}).get("h6") or 0)
-                        liq    = float((pair.get("liquidity") or {}).get("usd") or 0)
-                        if not (SCAN_MIN_MCAP <= mc <= SCAN_MAX_MCAP):
-                            continue
-                        if vol_1h < 300:
-                            continue
-                        results[mint] = {
-                            "mint":                mint,
-                            "name":                base.get("name", ""),
-                            "symbol":              base.get("symbol", ""),
-                            "mcap_usd":            mc,
-                            "liquidity_usd":       liq,
-                            "volume_1h_usd":       vol_1h,
-                            "volume_6h_usd":       vol_6h,
-                            "price_change_1h_pct": float((pair.get("priceChange") or {}).get("h1") or 0),
-                            "buy_sell_ratio_1h":   _safe_int((pair.get("txns") or {}).get("h1", {}).get("buys")) /
-                                                   max(_safe_int((pair.get("txns") or {}).get("h1", {}).get("sells")), 1),
-                            "total_holders":       _safe_int(pair.get("holders"), 0),
-                            "source":              "dexscreener",
-                        }
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        pairs = data.get("pairs") or (data if isinstance(data, list) else [])
+                        for pair in pairs[:200]:
+                            parsed = _parse_dex_pair(pair)
+                            if parsed and parsed["mint"] not in results:
+                                results[parsed["mint"]] = parsed
+                    await asyncio.sleep(0.3)
                 except Exception as e:
-                    log.warning(f"[SCANNER] DexScreener url error ({url.split('/')[-1]}): {e}")
+                    log.warning(f"[SCANNER] DexScreener pairs error: {e}")
+
     except Exception as e:
         log.warning(f"[SCANNER] DexScreener fetch error: {e}")
 
-    log.info(f"[SCANNER] DexScreener: {len(results)} unique candidates")
+    log.info(f"[SCANNER] DexScreener: {len(results)} unique candidates with full data")
     return list(results.values())
 
 def score_momentum(data: dict) -> dict:
