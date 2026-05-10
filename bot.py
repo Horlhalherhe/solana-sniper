@@ -2963,7 +2963,8 @@ async def fetch_momentum_candidates() -> list:
                 if resp.status_code == 200:
                     pairs = resp.json().get("pairs") or []
                     sol_pairs = [p for p in pairs if p.get("chainId") == "solana"]
-                    for pair in sol_pairs[:30]:
+                    _too_big = _too_small = _no_vol = _no_name = _added = 0
+                    for pair in sol_pairs[:50]:
                         base = pair.get("baseToken") or {}
                         mint = base.get("address", "")
                         mc   = float(pair.get("marketCap") or pair.get("fdv") or 0)
@@ -2973,14 +2974,14 @@ async def fetch_momentum_candidates() -> list:
                         name   = base.get("name", "")
                         symbol = base.get("symbol", "")
                         if not mint or not name:
-                            continue
-                        # Wider pre-filter — scoring will handle weak signals
+                            _no_name += 1; continue
                         if mc > 0 and mc > SCAN_MAX_MCAP * 2:
-                            continue  # Way too big
+                            _too_big += 1; continue
                         if mc > 0 and mc < SCAN_MIN_MCAP / 2:
-                            continue  # Way too small
+                            _too_small += 1; continue
                         if vol_1h < 100:
-                            continue  # No activity at all
+                            _no_vol += 1; continue
+                        _added += 1
                         # DexScreener already has all the data we need
                         candidate_mints[mint] = {
                             "name": name, "symbol": symbol,
@@ -2993,7 +2994,7 @@ async def fetch_momentum_candidates() -> list:
                             "source": "dexscreener_search",
                             "data_complete": True,  # No need to enrich further
                         }
-                    log.info(f"[SCANNER] DexScreener search '{term}': {len(sol_pairs)} solana pairs")
+                    log.info(f"[SCANNER] DexScreener '{term}': {len(sol_pairs)} sol pairs → added={_added} too_big={_too_big} too_small={_too_small} no_vol={_no_vol} no_name={_no_name}")
                 else:
                     log.warning(f"[SCANNER] DexScreener search '{term}': {resp.status_code}")
                 await asyncio.sleep(0.5)
