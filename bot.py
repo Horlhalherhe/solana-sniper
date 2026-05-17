@@ -1,5 +1,5 @@
 """
-TekkiSniPer v4.0 — CLEAN BUILD
+BagsUp10000x v4.0 — CLEAN BUILD
 Pump.fun → Narrative Match → Simple Score → Telegram Alert
 No v2 modules. No complex rug analysis. Just works.
 """
@@ -21,7 +21,7 @@ import httpx
 import websockets
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
-log = logging.getLogger("sniper-bot")
+log = logging.getLogger("bagsup-bot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -947,6 +947,30 @@ async def send_tg(text: str, chat_id: str = None) -> int:
             log.error(f"[TG] Send failed to {cid}: {e}")
     return last_id
 
+async def send_tg_document(file_path: str, chat_id: str = None, caption: str = "") -> int:
+    """Send a file as a document to Telegram. No truncation, unlike sendMessage."""
+    if not TELEGRAM_BOT_TOKEN:
+        print(f"[would send doc] {file_path}"); return 0
+    
+    targets = [chat_id] if chat_id else CHAT_IDS
+    if not targets: return 0
+    
+    last_id = 0
+    for cid in targets:
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                with open(file_path, "rb") as f:
+                    files = {"document": (Path(file_path).name, f.read(), "application/json")}
+                data = {"chat_id": cid, "caption": caption, "parse_mode": "HTML"}
+                resp = await client.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+                    data=data, files=files)
+                resp.raise_for_status()
+                last_id = resp.json().get("result", {}).get("message_id", 0)
+        except Exception as e:
+            log.error(f"[TG] Doc send failed to {cid}: {e}")
+    return last_id
+
 async def delete_webhook():
     if not TELEGRAM_BOT_TOKEN: return
     try:
@@ -1262,7 +1286,7 @@ def format_alert(token: dict, score: dict, narrative: dict) -> str:
     
     if is_cult:
         lines = [
-            "🔥🔥🔥 <b>TekkiSniPer — CULT ALERT</b> 🔥🔥🔥", "",
+            "🔥🔥🔥 <b>BagsUp10000x — CULT ALERT</b> 🔥🔥🔥", "",
             f"⚡ <b>CULT TOKEN DETECTED</b> ⚡", "",
             f"<b>{token_name}</b>  <code>${token_symbol}</code>",
             f"<code>{mint}</code>", "",
@@ -1271,7 +1295,7 @@ def format_alert(token: dict, score: dict, narrative: dict) -> str:
         ]
     elif scalp_match:
         lines = [
-            "⚡ <b>TekkiSniPer — SCALP ALERT</b> ⚡", "",
+            "⚡ <b>BagsUp10000x — SCALP ALERT</b> ⚡", "",
             f"🎰 <b>PUMP & DUMP PATTERN: '{scalp_pat}'</b>",
             f"<i>Known to pump 5-10X then rug — quick flip only, take profit fast</i>", "",
             f"<b>{token_name}</b>  <code>${token_symbol}</code>",
@@ -1281,7 +1305,7 @@ def format_alert(token: dict, score: dict, narrative: dict) -> str:
         ]
     else:
         lines = [
-            "🎯 <b>TekkiSniPer</b>", "",
+            "🎯 <b>BagsUp10000x</b>", "",
             f"<b>{token_name}</b>  <code>${token_symbol}</code>",
             f"<code>{mint}</code>", "",
             f"📊 <b>SCORE: {score['final_score']}/10</b>  {score['verdict']}",
@@ -1547,6 +1571,7 @@ def format_help() -> str:
         "/pnl7         — last 7 day P&L",
         "/trades       — open paper positions",
         "/paperreset   — clear all paper trades",
+        "/export       — download raw data files",
         "/help         — this menu",
     ])
 
@@ -2300,6 +2325,56 @@ async def handle_commands():
         except Exception as e:
             await send_tg(f"⚠️ Reset error: {e}", cid)
 
+    async def send_export(cid):
+        """Send raw leaderboard.json and paper_trades.json as file attachments — no truncation."""
+        try:
+            await send_tg("📦 Exporting data files... (this may take a moment)", cid)
+            sent_any = False
+            
+            # Leaderboard
+            if LEADERBOARD_FILE.exists():
+                size_kb = LEADERBOARD_FILE.stat().st_size / 1024
+                try:
+                    data = json.loads(LEADERBOARD_FILE.read_text())
+                    token_count = len(data) if isinstance(data, (list, dict)) else 0
+                except Exception:
+                    token_count = "?"
+                caption = (f"📊 <b>leaderboard.json</b>\n"
+                           f"Size: {size_kb:.1f} KB\n"
+                           f"Tokens: {token_count}")
+                await send_tg_document(str(LEADERBOARD_FILE), cid, caption)
+                sent_any = True
+            else:
+                await send_tg("⚠️ No leaderboard.json found yet.", cid)
+            
+            # Paper trades
+            if PAPER_FILE.exists():
+                size_kb = PAPER_FILE.stat().st_size / 1024
+                try:
+                    data = json.loads(PAPER_FILE.read_text())
+                    trade_count = len(data) if isinstance(data, (list, dict)) else 0
+                except Exception:
+                    trade_count = "?"
+                caption = (f"💰 <b>paper_trades.json</b>\n"
+                           f"Size: {size_kb:.1f} KB\n"
+                           f"Trades: {trade_count}")
+                await send_tg_document(str(PAPER_FILE), cid, caption)
+                sent_any = True
+            else:
+                await send_tg("⚠️ No paper_trades.json found yet.", cid)
+            
+            # Scalp patterns (small but useful)
+            if SCALP_FILE.exists():
+                await send_tg_document(str(SCALP_FILE), cid, "🎰 <b>scalp_patterns.json</b>")
+                sent_any = True
+            
+            if sent_any:
+                await send_tg("✅ Export complete. Upload these files for analysis.", cid)
+            log.info(f"[EXPORT] Sent data files to {cid}")
+        except Exception as e:
+            log.error(f"[EXPORT] Failed: {e}")
+            await send_tg(f"⚠️ Export error: {e}", cid)
+
     commands = {
         '/status':      lambda cid: send_tg(format_status(), cid),
         '/leaderboard': lambda cid: send_lb(cid, 1),
@@ -2318,6 +2393,7 @@ async def handle_commands():
         '/pnl7':        lambda cid: send_pnl(cid, 7),
         '/trades':      lambda cid: send_trades(cid),
         '/paperreset':  lambda cid: reset_paper(cid),
+        '/export':      lambda cid: send_export(cid),
         '/help':        lambda cid: send_tg(format_help(), cid),
     }
     
@@ -2918,7 +2994,7 @@ async def run():
         cat_counts[cat] = cat_counts.get(cat, 0) + 1
 
     log.info("=" * 50)
-    log.info("  TekkiSniPer — BOT ONLINE [v4.0 CLEAN]")
+    log.info("  BagsUp10000x — BOT ONLINE [v4.0 CLEAN]")
     log.info(f"  Threshold: {ALERT_THRESHOLD}  MinMCap: ${MIN_MCAP:,.0f}  MaxMCap: ${MAX_MCAP:,.0f}")
     log.info(f"  MaxDevHolds: {MAX_DEV_HOLDS_PCT}%  Wait: {WAIT_SECONDS}s")
     log.info(f"  Keywords: {kw_count} across {len(cat_counts)} categories")
@@ -2933,7 +3009,7 @@ async def run():
         await asyncio.sleep(2)
 
     await send_tg(
-        "🎯 <b>TekkiSniPer ONLINE [v4.0]</b>\n"
+        "🎯 <b>BagsUp10000x ONLINE [v4.0]</b>\n"
         f"Threshold: {ALERT_THRESHOLD}/10  |  Min MCap: ${MIN_MCAP:,.0f}\n"
         f"Keywords: {kw_count} ({', '.join(f'{c}:{n}' for c, n in sorted(cat_counts.items()))})\n"
         f"<i>Watching Pump.fun live...</i>"
