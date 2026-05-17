@@ -443,6 +443,29 @@ PAPER_TP2_X = 10.0   # Sell remaining 20% at 10X
 PAPER_SL_X = 0.3            # Stop loss at -70% (only after grace period)
 PAPER_SL_GRACE_MIN = 30     # No stop loss for first 30 minutes
 
+# ── v2 PAPER TRADE RULES (data-driven from leaderboard analysis) ───────────────
+# Backtest of 3129 historical alerts revealed:
+#   - 5min-checkpoint entry: LOSES money (68% dump after 5min; checkpoint catches tops)
+#   - Migration entry: PROFITABLE (61.9% hit 1.5X, 43.3% hit 2X from migration mcap)
+# So v2 = migration-only entry by default. 5min entry can be re-enabled by env flag for testing.
+
+# v2 exit rules tuned for MIGRATION entries (entered at ~$65k mcap)
+PAPER_V2_TP1_X      = 2.0     # TP1 at 2X (43% of migrations hit this)
+PAPER_V2_TP1_PCT    = 0.50    # Sell 50% — keep half for runners
+PAPER_V2_TP2_X      = 3.0     # TP2 at 3X (20% of migrations hit this)
+PAPER_V2_TP2_PCT    = 0.30    # Sell 30% — last 20% rides trailing
+PAPER_V2_TRAIL_PCT  = 0.50    # exit if current falls 50% from peak (last 20%)
+PAPER_V2_SL_EARLY_X = 0.5     # -50% SL early (no grace — migration is a strong signal,
+PAPER_V2_SL_LATE_X  = 0.5     #   if it dumps below -50% we're out, period)
+PAPER_V2_SL_EARLY_MIN = 10
+
+# ── v2 5-MIN ENTRY (DISABLED by default — backtest shows it loses) ────────────
+# Set V2_5MIN_ENTRY_ENABLED=1 in env to re-enable for testing variants
+V2_5MIN_ENTRY_ENABLED    = os.getenv("V2_5MIN_ENTRY_ENABLED", "0") == "1"
+V2_ENTRY_MIN_X_AT_5MIN   = 2.0     # Tighter: only enter if up 2X+ by 5min (very rare, ~70 tokens)
+V2_ENTRY_MIN_BUY_RATIO   = 1.3
+V2_ENTRY_MIN_VOL_USD     = 25000
+
 paper_trades: List[dict] = []
 paper_lock = asyncio.Lock()
 
@@ -493,9 +516,12 @@ def paper_buy(mint: str, name: str, symbol: str, entry_mcap: float, score: float
     return trade
 
 def paper_update_price(mint: str, current_mcap: float) -> list:
-    """Update price and execute TP/SL. Returns list of messages to send."""
+    """Update price and execute TP/SL. Returns list of messages to send. v1 only."""
     messages = []
     for trade in paper_trades:
+        # Skip v2 trades — they have their own update function
+        if trade.get("version") == "v2":
+            continue
         if trade["mint"] != mint or trade["status"] == "closed":
             continue
         
@@ -570,6 +596,173 @@ def paper_update_price(mint: str, current_mcap: float) -> list:
                 f"💰 Sold remaining 20% → Total P&L: <b>+{pnl:.2f} SOL</b> 🔥"
             )
             log.info(f"[PAPER] TP2 {symbol} @ {current_x:.1f}X — FULL EXIT — P&L: +{pnl:.2f} SOL")
+    
+    return messages
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v2 PAPER TRADE LOGIC (data-driven, runs in parallel with v1 for A/B comparison)
+# ═══════════════════════════════════════════════════════════════════════════════
+def paper_buy_v2(mint: str, name: str, symbol: str, entry_mcap: float, score: float, alert_type: str = "v2_5min"):
+    """Record a v2 paper buy. Same shape as v1 trade dict with version='v2' and trigger field.
+    alert_type: 'v2_5min' = qualified at 5-min lifecycle | 'v2_migration' = entered at migration"""
+    # Dedupe: never v2-buy the same mint twice
+    for t in paper_trades:
+        if t.get("mint") == mint and t.get("version") == "v2":
+            return None
+    
+    trade = {
+        "version": "v2",
+        "mint": mint,
+        "name": name,
+        "symbol": symbol,
+        "entry_mcap": entry_mcap,
+        "entry_score": score,
+        "entry_sol": PAPER_SOL_PER_TRADE,
+        "alert_type": alert_type,
+        "status": "open",                # open, tp1, tp2, closed
+        "sol_remaining": PAPER_SOL_PER_TRADE,
+        "sol_realized": 0.0,
+        "current_mcap": entry_mcap,
+        "current_x": 1.0,
+        "peak_x": 1.0,
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "trail_armed": False,            # becomes True after TP2 hits
+        "sl_hit": False,
+        "opened_at": utcnow().isoformat(),
+        "closed_at": None,
+    }
+    paper_trades.append(trade)
+    log.info(f"[PAPER-V2] BUY {symbol} @ ${entry_mcap:,.0f} — 1 SOL ({alert_type})")
+    return trade
+
+
+def paper_update_price_v2(mint: str, current_mcap: float) -> list:
+    """v2 update logic: tighter SL, faster TP1, trailing stop on runner.
+    Returns list of telegram messages to send."""
+    messages = []
+    for trade in paper_trades:
+        if trade.get("version") != "v2":
+            continue
+        if trade["mint"] != mint or trade["status"] == "closed":
+            continue
+        
+        entry_mcap = trade["entry_mcap"]
+        if entry_mcap <= 0:
+            continue
+        
+        current_x = min(current_mcap / entry_mcap, 500)
+        trade["current_mcap"] = current_mcap
+        trade["current_x"] = round(current_x, 2)
+        prev_peak = trade["peak_x"]
+        trade["peak_x"] = max(prev_peak, current_x)
+        
+        name = trade["name"]
+        symbol = trade["symbol"]
+        
+        # Compute age
+        try:
+            opened = datetime.fromisoformat(trade.get("opened_at", "2000-01-01"))
+            age_min = (utcnow() - opened).total_seconds() / 60
+        except Exception:
+            age_min = 999
+        
+        # ── Trailing Stop on runner portion (after TP2 hit, last 10% rides) ──
+        if trade["tp2_hit"] and trade["trail_armed"] and not trade["sl_hit"]:
+            trail_trigger = trade["peak_x"] * (1 - PAPER_V2_TRAIL_PCT)
+            if current_x <= trail_trigger:
+                sol_out = trade["sol_remaining"] * current_x
+                trade["sol_realized"] += sol_out
+                trade["sol_remaining"] = 0
+                trade["status"] = "closed"
+                trade["closed_at"] = utcnow().isoformat()
+                pnl = trade["sol_realized"] - trade["entry_sol"]
+                messages.append(
+                    f"📉 <b>PAPER v2 TRAILING STOP</b>\n\n"
+                    f"<b>{name}</b> ${symbol}\n"
+                    f"Peak: {trade['peak_x']:.1f}X → Current: {current_x:.1f}X (-{PAPER_V2_TRAIL_PCT*100:.0f}% from peak)\n"
+                    f"💰 Sold runner → Total P&L: <b>{pnl:+.2f} SOL</b>"
+                )
+                log.info(f"[PAPER-V2] TRAIL {symbol} peak {trade['peak_x']:.1f}X → exit {current_x:.1f}X — P&L: {pnl:+.2f}")
+                continue
+        
+        # ── Stop Loss: early (-40% in first 10min) or late (-55% after) ──
+        if not trade["sl_hit"] and not trade["tp1_hit"]:
+            sl_threshold = PAPER_V2_SL_EARLY_X if age_min < PAPER_V2_SL_EARLY_MIN else PAPER_V2_SL_LATE_X
+            if current_x <= sl_threshold:
+                trade["sl_hit"] = True
+                sol_out = trade["sol_remaining"] * current_x
+                trade["sol_realized"] += sol_out
+                trade["sol_remaining"] = 0
+                trade["status"] = "closed"
+                trade["closed_at"] = utcnow().isoformat()
+                pnl = trade["sol_realized"] - trade["entry_sol"]
+                sl_label = "-40%" if age_min < PAPER_V2_SL_EARLY_MIN else "-55%"
+                messages.append(
+                    f"🔴 <b>PAPER v2 STOP LOSS ({sl_label})</b>\n\n"
+                    f"<b>{name}</b> ${symbol}\n"
+                    f"Entry: ${entry_mcap:,.0f} → ${current_mcap:,.0f} ({current_x:.2f}X)\n"
+                    f"⏱ Age: {age_min:.0f}min\n"
+                    f"💰 Sold all → <b>{pnl:+.2f} SOL</b>"
+                )
+                log.info(f"[PAPER-V2] SL {symbol} @ {current_x:.2f}X after {age_min:.0f}min — P&L: {pnl:+.2f}")
+                continue
+        
+        # ── Take Profit 1: 1.5X → sell 60% ──
+        if current_x >= PAPER_V2_TP1_X and not trade["tp1_hit"]:
+            trade["tp1_hit"] = True
+            sell_amount = trade["entry_sol"] * PAPER_V2_TP1_PCT
+            sol_out = sell_amount * current_x
+            trade["sol_realized"] += sol_out
+            trade["sol_remaining"] = trade["entry_sol"] * (1 - PAPER_V2_TP1_PCT)
+            trade["status"] = "tp1"
+            messages.append(
+                f"🟢 <b>PAPER v2 TAKE PROFIT 1 (1.5X)</b>\n\n"
+                f"<b>{name}</b> ${symbol}\n"
+                f"Entry: ${entry_mcap:,.0f} → ${current_mcap:,.0f} ({current_x:.2f}X)\n"
+                f"💰 Sold 60% → <b>+{sol_out:.2f} SOL</b>\n"
+                f"📊 Remaining: {trade['sol_remaining']:.2f} SOL"
+            )
+            log.info(f"[PAPER-V2] TP1 {symbol} @ {current_x:.2f}X — sold 60% for {sol_out:.2f}")
+            continue
+        
+        # ── Take Profit 2: 3X → sell 30%, arm trail on remaining 10% ──
+        if current_x >= PAPER_V2_TP2_X and trade["tp1_hit"] and not trade["tp2_hit"]:
+            trade["tp2_hit"] = True
+            trade["trail_armed"] = True
+            # Sell 30% of original (which is 75% of what remains after TP1)
+            sell_sol = trade["entry_sol"] * PAPER_V2_TP2_PCT
+            sol_out = sell_sol * current_x
+            trade["sol_realized"] += sol_out
+            trade["sol_remaining"] = trade["entry_sol"] * (1 - PAPER_V2_TP1_PCT - PAPER_V2_TP2_PCT)
+            trade["status"] = "tp2"
+            messages.append(
+                f"💎 <b>PAPER v2 TAKE PROFIT 2 (3X)</b>\n\n"
+                f"<b>{name}</b> ${symbol}\n"
+                f"Entry: ${entry_mcap:,.0f} → ${current_mcap:,.0f} ({current_x:.1f}X)\n"
+                f"💰 Sold 30% → +{sol_out:.2f} SOL\n"
+                f"📊 Last 10% riding with 50% trailing stop from peak"
+            )
+            log.info(f"[PAPER-V2] TP2 {symbol} @ {current_x:.1f}X — trail armed")
+            continue
+        
+        # ── Late SL: even after TP1, if it crashes hard back through SL we still exit ──
+        if trade["tp1_hit"] and not trade["tp2_hit"] and not trade["sl_hit"]:
+            if current_x <= PAPER_V2_SL_LATE_X:
+                trade["sl_hit"] = True
+                sol_out = trade["sol_remaining"] * current_x
+                trade["sol_realized"] += sol_out
+                trade["sol_remaining"] = 0
+                trade["status"] = "closed"
+                trade["closed_at"] = utcnow().isoformat()
+                pnl = trade["sol_realized"] - trade["entry_sol"]
+                messages.append(
+                    f"🟠 <b>PAPER v2 LATE STOP (after TP1)</b>\n\n"
+                    f"<b>{name}</b> ${symbol}\n"
+                    f"Crashed back to {current_x:.2f}X — Total P&L: <b>{pnl:+.2f} SOL</b>"
+                )
+                log.info(f"[PAPER-V2] LATE-SL {symbol} @ {current_x:.2f}X — P&L: {pnl:+.2f}")
     
     return messages
 
@@ -1566,9 +1759,13 @@ def format_help() -> str:
         "/scalpadd X   — add scalp pattern",
         "/scalprem X   — remove scalp pattern",
         "/topx N       — tokens that hit NX+",
-        "/pnl          — paper trading P&L",
+        "/pnl          — paper trading P&L (all)",
         "/pnl24        — last 24h P&L",
         "/pnl7         — last 7 day P&L",
+        "/pnlv1        — v1 (legacy) P&L only",
+        "/pnlv2        — v2 (new strategy) P&L only",
+        "/pnlcompare   — A/B v1 vs v2 verdict",
+        "/pnlcompare7  — A/B v1 vs v2 last 7d",
         "/trades       — open paper positions",
         "/paperreset   — clear all paper trades",
         "/export       — download raw data files",
@@ -1605,9 +1802,11 @@ async def track_tokens():
                     t.peak_x = min(t.peak_mcap / max(t.entry_mcap, 1000), 500)  # Cap at 500X
                     t.last_updated = utcnow()
                     
+                    new_migration = False
                     if migrated and not t.migration_verified:
                         t.migrated = t.migration_verified = True
                         t.status = "migrated"
+                        new_migration = True
                         log.info(f"[TRACKER] Migration: {t.symbol}")
                         await send_tg(format_migration(t, mcap))
                     
@@ -1619,13 +1818,33 @@ async def track_tokens():
                                 log.info(f"[TRACKER] {x}X: {t.symbol}")
                                 await send_tg(format_x_alert(t, mcap, x))
                 
-                # Update paper trades for this token
+                # ── v2 PAPER TRADE: migration entry ──
+                # Backtest of 344 historical migrations: 43.3% hit 2X, 20.3% hit 3X.
+                # Migration entry is the strongest signal in the dataset.
+                if new_migration:
+                    try:
+                        async with paper_lock:
+                            v2_trade = paper_buy_v2(mint, t.name, t.symbol, mcap, t.entry_score, "v2_migration")
+                        if v2_trade:
+                            asyncio.create_task(save_paper_trades())
+                            await send_tg(
+                                f"🎓 <b>PAPER v2 ENTRY — Migration</b>\n\n"
+                                f"<b>{t.name}</b> ${t.symbol}\n"
+                                f"Entry: ${mcap:,.0f}\n"
+                                f"Strategy: 2X/50% → 3X/30% → trail last 20%\n"
+                                f"<i>Backtest: 43% hit 2X, 20% hit 3X</i>"
+                            )
+                    except Exception as e:
+                        log.error(f"[PAPER-V2] Migration buy failed for {t.symbol}: {e}")
+                
+                # Update paper trades for this token (v1 + v2)
                 try:
                     async with paper_lock:
-                        msgs = paper_update_price(mint, mcap)
-                    for m in msgs:
+                        msgs_v1 = paper_update_price(mint, mcap)
+                        msgs_v2 = paper_update_price_v2(mint, mcap)
+                    for m in msgs_v1 + msgs_v2:
                         await send_tg(m)
-                    if msgs:
+                    if msgs_v1 or msgs_v2:
                         asyncio.create_task(save_paper_trades())
                 except Exception:
                     pass
@@ -2165,13 +2384,24 @@ async def handle_commands():
         else:
             await send_tg(msg, cid)
 
-    async def send_pnl(cid, days=None):
+    async def send_pnl(cid, days=None, version_filter=None):
+        """version_filter: None=all, 'v1'=legacy only, 'v2'=new only"""
         try:
             async with paper_lock:
                 trades = list(paper_trades)
             
+            # Version filter
+            if version_filter == "v1":
+                trades = [t for t in trades if t.get("version") != "v2"]
+                ver_label = " (v1 legacy)"
+            elif version_filter == "v2":
+                trades = [t for t in trades if t.get("version") == "v2"]
+                ver_label = " (v2 new)"
+            else:
+                ver_label = ""
+            
             if not trades:
-                await send_tg("💰 No paper trades yet. Waiting for alerts!", cid)
+                await send_tg(f"💰 No paper trades yet{ver_label}.", cid)
                 return
             
             # Filter by time period
@@ -2236,7 +2466,7 @@ async def handle_commands():
             
             pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
             
-            msg = f"💰 <b>PAPER TRADING P&L — {period}</b>\n\n"
+            msg = f"💰 <b>PAPER TRADING P&L — {period}{ver_label}</b>\n\n"
             msg += f"<b>Portfolio:</b> {total} trades\n"
             msg += f"Invested:  <b>{total_invested:.1f} SOL</b>\n"
             msg += f"Current:   <b>{total_current:.1f} SOL</b>\n"
@@ -2246,10 +2476,17 @@ async def handle_commands():
             msg += f"Closed: {len(closed_trades)} positions\n"
             msg += f"Win rate (2X+): <b>{win_rate}%</b>\n\n"
             
-            msg += f"<b>── TP/SL Stats ──</b>\n"
-            msg += f"✅ TP1 (2X): {len(tp1_hits)} hits\n"
-            msg += f"💎 TP2 (10X): {len(tp2_hits)} hits\n"
-            msg += f"🔴 Stop Loss (-70% after 30min): {len(sl_hits)} hits\n\n"
+            # TP/SL labels depend on version
+            if version_filter == "v2":
+                msg += f"<b>── TP/SL Stats (v2 rules) ──</b>\n"
+                msg += f"✅ TP1 (2X / sell 50%): {len(tp1_hits)} hits\n"
+                msg += f"💎 TP2 (3X / sell 30%): {len(tp2_hits)} hits\n"
+                msg += f"🔴 Stop Loss (-50%): {len(sl_hits)} hits\n\n"
+            else:
+                msg += f"<b>── TP/SL Stats ──</b>\n"
+                msg += f"✅ TP1 (2X): {len(tp1_hits)} hits\n"
+                msg += f"💎 TP2 (10X): {len(tp2_hits)} hits\n"
+                msg += f"🔴 Stop Loss (-70% after 30min): {len(sl_hits)} hits\n\n"
             
             if best_trade:
                 bp = best_trade.get("peak_x", 0)
@@ -2375,6 +2612,76 @@ async def handle_commands():
             log.error(f"[EXPORT] Failed: {e}")
             await send_tg(f"⚠️ Export error: {e}", cid)
 
+    async def send_pnl_compare(cid, days=None):
+        """Side-by-side A/B comparison of v1 vs v2 paper trade performance."""
+        try:
+            async with paper_lock:
+                trades = list(paper_trades)
+            
+            if days:
+                cutoff = utcnow() - timedelta(days=days)
+                trades = [t for t in trades if datetime.fromisoformat(t.get("opened_at","2000-01-01")) >= cutoff]
+            
+            def calc(group):
+                if not group:
+                    return None
+                n = len(group)
+                invested = sum(t.get("entry_sol",1.0) for t in group)
+                realized = sum(t.get("sol_realized",0) for t in group)
+                open_val = sum(t.get("sol_remaining",0)*t.get("current_x",1.0)
+                               for t in group if t["status"] != "closed")
+                current = realized + open_val
+                pnl = current - invested
+                pnl_pct = (pnl/invested*100) if invested>0 else 0
+                wins = sum(1 for t in group if t.get("peak_x",1) >= 2.0)
+                wr = 100*wins/n if n else 0
+                tp1 = sum(1 for t in group if t.get("tp1_hit"))
+                tp2 = sum(1 for t in group if t.get("tp2_hit"))
+                sl = sum(1 for t in group if t.get("sl_hit"))
+                closed = sum(1 for t in group if t["status"]=="closed")
+                return dict(n=n, invested=invested, current=current, pnl=pnl, pnl_pct=pnl_pct,
+                           wr=wr, tp1=tp1, tp2=tp2, sl=sl, closed=closed)
+            
+            v1 = calc([t for t in trades if t.get("version") != "v2"])
+            v2 = calc([t for t in trades if t.get("version") == "v2"])
+            
+            period = "ALL TIME" if not days else (f"{days}D" if days != 1 else "24H")
+            msg = f"📊 <b>A/B COMPARISON — {period}</b>\n\n"
+            
+            if not v1 and not v2:
+                msg += "<i>No trades yet.</i>"
+                await send_tg(msg, cid)
+                return
+            
+            def fmt_block(label, d):
+                if not d:
+                    return f"<b>{label}:</b> <i>no trades</i>\n\n"
+                e = "🟢" if d["pnl"] >= 0 else "🔴"
+                out = f"<b>{label}</b> ({d['n']} trades, {d['closed']} closed)\n"
+                out += f"  P&L: {e} <b>{d['pnl']:+.2f} SOL</b> ({d['pnl_pct']:+.1f}%)\n"
+                out += f"  Win rate (≥2X peak): {d['wr']:.1f}%\n"
+                out += f"  TP1/TP2/SL: {d['tp1']}/{d['tp2']}/{d['sl']}\n\n"
+                return out
+            
+            msg += fmt_block("v1 (legacy: 2X/80%, 10X/20%, SL -70%)", v1)
+            msg += fmt_block("v2 (migration-entry: 2X/50%, 3X/30%, trail, SL -50%)", v2)
+            
+            # Verdict
+            if v1 and v2 and v2["n"] >= 10:
+                if v2["pnl_pct"] > v1["pnl_pct"]:
+                    msg += f"✅ <b>v2 leading by {v2['pnl_pct']-v1['pnl_pct']:+.1f}pp</b>"
+                elif v2["pnl_pct"] < v1["pnl_pct"]:
+                    msg += f"⚠️ <b>v1 still ahead by {v1['pnl_pct']-v2['pnl_pct']:+.1f}pp</b>"
+                else:
+                    msg += "➖ <b>Tied — need more data</b>"
+            elif v2 and v2["n"] < 10:
+                msg += f"<i>Need ≥10 v2 trades for a verdict (have {v2['n']}).</i>"
+            
+            await send_tg(msg, cid)
+        except Exception as e:
+            log.error(f"[PNL-COMPARE] {e}")
+            await send_tg(f"⚠️ Compare error: {e}", cid)
+
     commands = {
         '/status':      lambda cid: send_tg(format_status(), cid),
         '/leaderboard': lambda cid: send_lb(cid, 1),
@@ -2391,6 +2698,12 @@ async def handle_commands():
         '/pnl':         lambda cid: send_pnl(cid),
         '/pnl24':       lambda cid: send_pnl(cid, 1),
         '/pnl7':        lambda cid: send_pnl(cid, 7),
+        '/pnlv1':       lambda cid: send_pnl(cid, None, "v1"),
+        '/pnlv2':       lambda cid: send_pnl(cid, None, "v2"),
+        '/pnlv2_24':    lambda cid: send_pnl(cid, 1, "v2"),
+        '/pnlv2_7':     lambda cid: send_pnl(cid, 7, "v2"),
+        '/pnlcompare':  lambda cid: send_pnl_compare(cid),
+        '/pnlcompare7': lambda cid: send_pnl_compare(cid, 7),
         '/trades':      lambda cid: send_trades(cid),
         '/paperreset':  lambda cid: reset_paper(cid),
         '/export':      lambda cid: send_export(cid),
@@ -2818,6 +3131,29 @@ async def lifecycle_tracker(mint, name, symbol, deployer, desc, narrative, entry
                 checkpoints.append(snap)
                 
                 log.info(f"[LIFECYCLE] {symbol} @ {label}: mcap=${mcap_now:,.0f} ({current_x:.1f}X) holders={holders_now} vol=${vol_now:,.0f}")
+                
+                # ── v2 PAPER TRADE ENTRY: qualify at 5-min checkpoint ──
+                # NOTE: 5-min entry is DISABLED by default. Backtest of 3129 historical
+                # alerts showed it loses money (5-min checkpoint catches tops, not bottoms).
+                # Re-enable by setting V2_5MIN_ENTRY_ENABLED=1 in env to test variants.
+                if V2_5MIN_ENTRY_ENABLED and label == "5min" and mcap_now > 0:
+                    if (current_x >= V2_ENTRY_MIN_X_AT_5MIN
+                        and buy_ratio_now >= V2_ENTRY_MIN_BUY_RATIO
+                        and vol_now >= V2_ENTRY_MIN_VOL_USD):
+                        try:
+                            async with paper_lock:
+                                v2_trade = paper_buy_v2(mint, name, symbol, mcap_now, initial_score, "v2_5min")
+                            if v2_trade:
+                                asyncio.create_task(save_paper_trades())
+                                await send_tg(
+                                    f"✅ <b>PAPER v2 ENTRY — 5min Qualified (experimental)</b>\n\n"
+                                    f"<b>{name}</b> ${symbol}\n"
+                                    f"Entry mcap: ${mcap_now:,.0f}\n"
+                                    f"5min stats: {current_x:.2f}X | buy/sell {buy_ratio_now:.2f} | vol ${vol_now:,.0f}"
+                                )
+                                log.info(f"[PAPER-V2] 5min entry qualified: {symbol} x={current_x:.2f} br={buy_ratio_now:.2f} vol=${vol_now:,.0f}")
+                        except Exception as e:
+                            log.error(f"[PAPER-V2] 5min buy failed for {symbol}: {e}")
                 
             except Exception as e:
                 log.warning(f"[LIFECYCLE] {symbol} @ {label}: {e}")
